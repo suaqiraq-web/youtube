@@ -26,6 +26,7 @@ from telegram.ext import (
 )
 
 load_dotenv()
+BASE_DIR = Path(__file__).resolve().parent
 
 logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
@@ -54,6 +55,7 @@ if SESSION_STRING_2:
 configured_session_strings = list(dict.fromkeys(configured_session_strings))
 CACHE_DIR = Path(os.getenv("CACHE_DIR", "cache"))
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
+COOKIES_PATH = BASE_DIR / "cookies.txt"
 AUDIO_FILE_IDS_PATH = CACHE_DIR / "audio_file_ids.json"
 
 try:
@@ -91,8 +93,9 @@ def search_song(query: str, download: bool = False) -> dict[str, Any]:
         "default_search": "ytsearch1",
         "extractaudio": True,
         "audioformat": "mp3",
-        "cookiefile": str(Path("cookies.txt")),
     }
+    if COOKIES_PATH.is_file():
+        options["cookiefile"] = str(COOKIES_PATH)
     if download:
         options.update(
             {
