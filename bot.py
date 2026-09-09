@@ -18,6 +18,7 @@ from pytgcalls import GroupCallFactory
 from pytgcalls.implementation.group_call_file import GroupCallFile
 from telegram import ChatPermissions, InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ChatType
+from telegram.helpers import escape_markdown
 from telegram.ext import (
     Application,
     ApplicationHandlerStop,
@@ -246,6 +247,20 @@ def normalized_query(query: str) -> str:
     return re.sub(r"\s+", " ", query.strip().casefold())
 
 
+def format_song_duration(duration: Any) -> str:
+    if duration is None:
+        return "غير معروفة"
+    try:
+        total_seconds = max(0, int(float(duration)))
+    except (TypeError, ValueError):
+        return "غير معروفة"
+    minutes, seconds = divmod(total_seconds, 60)
+    hours, minutes = divmod(minutes, 60)
+    if hours:
+        return f"{hours}:{minutes:02d}:{seconds:02d}"
+    return f"{minutes}:{seconds:02d}"
+
+
 def save_audio_file_id(query: str, file_id: str) -> None:
     """حفظ معرف الملف حتى يعاد إرساله من تيليجرام بدون رفع جديد."""
     AUDIO_FILE_IDS[normalized_query(query)] = file_id
@@ -380,6 +395,12 @@ def warning_key(chat_id: int, user_id: int) -> str:
     return f"{chat_id}:{user_id}"
 
 
+def protection_target_label(target: Any) -> str:
+    if target.username:
+        return f"@{escape_markdown(target.username, version=2)}"
+    return escape_markdown(target.first_name or "العضو", version=2)
+
+
 def save_warnings() -> None:
     
     WARNINGS_PATH.write_text(
@@ -433,7 +454,9 @@ async def mute_member(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             user_id=target.id,
             permissions=ChatPermissions(can_send_messages=False),
         )
-        await message.reply_text(f"🔇 تم كتم {target.first_name}.")
+        await message.reply_text(
+            f"『⛔️』 تم تقييد {protection_target_label(target)} ⚠️ بسبب مخالفة القوانين\."
+        , parse_mode="MarkdownV2")
     except Exception:
         logger.exception("Could not mute user %s in chat %s", target.id, message.chat.id)
         await message.reply_text("❌ لم أستطع كتم العضو. تأكد أن البوت مشرف ولديه صلاحية تقييد الأعضاء.")
@@ -481,7 +504,9 @@ async def warn_member(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             user_id=target.id,
             permissions=ChatPermissions(can_send_messages=False),
         )
-        await message.reply_text(f"🔇 وصل {target.first_name} إلى 3 تحذيرات وتم كتمه.")
+        await message.reply_text(
+            f"『⛔️』 تم تقييد {protection_target_label(target)} ⚠️ بسبب مخالفة القوانين\."
+        , parse_mode="MarkdownV2")
     except Exception:
         logger.exception("Could not auto-mute user %s in chat %s", target.id, message.chat.id)
         await message.reply_text(
@@ -665,6 +690,13 @@ async def play_song(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             audio_path = cached_path
 
         title = song.get("title", query)
+        requester = message.from_user
+        requester_name = (
+            f"@{requester.username}"
+            if requester and requester.username
+            else (requester.first_name if requester else "غير معروف")
+        )
+        duration = format_song_duration(song.get("duration"))
 
         audio_path = await asyncio.to_thread(convert_to_voice_wav, Path(audio_path))
 
@@ -725,7 +757,13 @@ async def play_song(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         except Exception:
             logger.warning("Could not delete voice preparation message")
         try:
-            await message.reply_text(f"▶️ يتم تشغيل: {title}")
+            await message.reply_text(
+                "🎧 تم تشغيل الموسيقى\n\n"
+                f"🎶 الأغنية: {title}\n"
+                f"👤 طلب بواسطة: {requester_name}\n"
+                f"⏱️ المدة: {duration}\n\n"
+                "✅ استمتع!"
+            )
         except Exception:
             logger.warning("Voice started, but confirmation message could not be sent")
         return
