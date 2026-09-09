@@ -176,7 +176,7 @@ def search_song(query: str, download: bool = False) -> dict[str, Any]:
         "quiet": True,
         "no_warnings": True,
         "noplaylist": True,
-        "default_search": "ytsearch5",
+        "default_search": "ytsearch10",
         "extractaudio": True,
         "audioformat": "mp3",
         "extractor_retries": 2,
@@ -184,90 +184,43 @@ def search_song(query: str, download: bool = False) -> dict[str, Any]:
         "retries": 2,
         "sleep_interval_requests": 0,
         "force_ipv4": True,
-        "js_runtimes": {"deno": {}},
     }
-    if not download:
-        # البحث عن النتيجة فقط؛ لا تطلب صيغ الفيديو قبل بدء التنزيل.
-        options["extract_flat"] = "in_playlist"
     if COOKIES_PATH.is_file() and os.getenv("USE_YOUTUBE_COOKIES", "0") == "1":
         options["cookiefile"] = str(COOKIES_PATH)
-    if download:
-        options.update(
-            {
-                "format": "bestaudio[ext=m4a]/bestaudio/best",
-                "concurrent_fragment_downloads": 8,
-                "socket_timeout": 8,
-                "outtmpl": str(CACHE_DIR / "%(id)s.%(ext)s"),
-                "postprocessors": [
-                    {
-                        "key": "FFmpegExtractAudio",
-                        "preferredcodec": "mp3",
-                        "preferredquality": "128",
-                    },
-                ],
-                "postprocessor_args": {
-                    "ExtractAudio": ["-ac", "2", "-ar", "44100"],
-                },
-            }
-        )
+    search_options = options.copy()
+    search_options["extract_flat"] = "in_playlist"
 
-    is_youtube_url = bool(re.match(r"^https?://(?:www\.)?(?:youtube\.com|youtu\.be)/", query, re.IGNORECASE))
-    lookup_options = options
-    if download and not is_youtube_url:
-        lookup_options = options.copy()
-        lookup_options["extract_flat"] = "in_playlist"
-        lookup_options["skip_download"] = True
-
-    client_profiles = (None, ["web_safari"], ["android_vr"])
-    last_error: Exception | None = None
-    for attempt, client_profile in enumerate(client_profiles):
-        try:
-            attempt_options = lookup_options.copy()
-            if client_profile is not None:
-                # لا تعيد استخدام كوكيز قديمة مع العملاء البدلاء؛ قد تسبب 403.
-                attempt_options.pop("cookiefile", None)
-                attempt_options["extractor_args"] = {
-                    "youtube": {"player_client": client_profile},
-                }
-            with yt_dlp.YoutubeDL(attempt_options) as downloader:
-                info = downloader.extract_info(query, download=download)
-            break
-        except Exception as error:
-            last_error = error
-            if attempt == len(client_profiles) - 1:
-                raise
-            logger.warning(
-                "YouTube request failed (%s/%s), retrying with another client: %s",
-                attempt + 1,
-                len(client_profiles),
-                error,
-            )
-            time.sleep(0.5)
-    else:
-        raise last_error or RuntimeError("فشل طلب YouTube")
+    with yt_dlp.YoutubeDL(search_options) as downloader:
+        info = downloader.extract_info(query, download=False)
 
     if not info:
-        raise ValueError("لم يتم العثور على نتيجة")
-    if "entries" in info:
-        entries = [entry for entry in info["entries"] if entry]
-        if not entries:
-            raise ValueError("لم يتم العثور على نتيجة")
-        if not download:
-            return entries[0]
+        raise ValueError("الأغنية غير موجودة")
+    entries = [entry for entry in info.get("entries", [info]) if entry]
+    if not entries:
+        raise ValueError("الأغنية غير موجودة")
+    if not download:
+        return entries[0]
 
-        # جرّب النتائج التالية إذا كانت أول نتيجة محجوبة أو غير قابلة للتنزيل.
-        for entry in entries:
-            try:
-                entry_url = entry.get("webpage_url") or entry.get("url")
-                if not entry_url:
-                    continue
-                with yt_dlp.YoutubeDL(options) as downloader:
-                    return downloader.extract_info(entry_url, download=True)
-            except Exception as error:
-                last_error = error
-                logger.warning("تعذر تنزيل نتيجة YouTube، تجربة النتيجة التالية: %s", error)
-        raise last_error or ValueError("تعذر تنزيل أي نتيجة")
-    return info
+    download_options = options.copy()
+    download_options.update(
+        {
+            "format": "bestaudio/best",
+            "outtmpl": str(CACHE_DIR / "%(id)s.%(ext)s"),
+        }
+    )
+    last_error: Exception | None = None
+    for entry in entries[:10]:
+        entry_url = entry.get("webpage_url") or entry.get("url")
+        if not entry_url:
+            continue
+        try:
+            with yt_dlp.YoutubeDL(download_options) as downloader:
+                return downloader.extract_info(entry_url, download=True)
+        except Exception as error:
+            last_error = error
+            logger.warning("تعذر تنزيل إحدى نتائج البحث: %s", error)
+
+    raise ValueError("الأغنية غير موجودة ضمن أول 10 نتائج") from last_error
 
 
 def downloaded_audio(song: dict[str, Any]) -> Path:
