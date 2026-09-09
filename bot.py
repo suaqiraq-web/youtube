@@ -99,6 +99,7 @@ def search_song(query: str, download: bool = False) -> dict[str, Any]:
         "retries": 5,
         "sleep_interval_requests": 1,
         "force_ipv4": True,
+        "js_runtimes": {"deno": {}},
     }
     if COOKIES_PATH.is_file():
         options["cookiefile"] = str(COOKIES_PATH)
@@ -122,11 +123,18 @@ def search_song(query: str, download: bool = False) -> dict[str, Any]:
             }
         )
 
-    client_profiles = (None, ["web_safari"], ["android_vr"], ["ios"])
+    client_profiles = (
+        (None, "bestaudio/best"),
+        (["web_safari"], "best[ext=mp4]/best"),
+        (["android_vr"], "best"),
+        (["ios"], "best[ext=mp4]/best"),
+    )
     last_error: Exception | None = None
-    for attempt, client_profile in enumerate(client_profiles):
+    for attempt, (client_profile, format_selector) in enumerate(client_profiles):
         try:
             attempt_options = options.copy()
+            if download:
+                attempt_options["format"] = format_selector
             if client_profile is not None:
                 attempt_options["extractor_args"] = {
                     "youtube": {"player_client": client_profile},
