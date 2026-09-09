@@ -185,7 +185,7 @@ def search_song(query: str, download: bool = False) -> dict[str, Any]:
         "sleep_interval_requests": 0,
         "force_ipv4": True,
     }
-    if COOKIES_PATH.is_file() and os.getenv("USE_YOUTUBE_COOKIES", "0") == "1":
+    if COOKIES_PATH.is_file() and os.getenv("USE_YOUTUBE_COOKIES", "1") != "0":
         options["cookiefile"] = str(COOKIES_PATH)
     search_options = options.copy()
     search_options["extract_flat"] = "in_playlist"
