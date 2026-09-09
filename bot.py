@@ -94,10 +94,10 @@ def search_song(query: str, download: bool = False) -> dict[str, Any]:
         "default_search": "ytsearch1",
         "extractaudio": True,
         "audioformat": "mp3",
-        "extractor_retries": 5,
-        "fragment_retries": 5,
-        "retries": 5,
-        "sleep_interval_requests": 1,
+        "extractor_retries": 2,
+        "fragment_retries": 2,
+        "retries": 2,
+        "sleep_interval_requests": 0,
         "force_ipv4": True,
         "js_runtimes": {"deno": {}},
     }
@@ -106,9 +106,9 @@ def search_song(query: str, download: bool = False) -> dict[str, Any]:
     if download:
         options.update(
             {
-                "format": "bestaudio/best",
-                "concurrent_fragment_downloads": 4,
-                "socket_timeout": 10,
+                "format": "worstaudio/bestaudio/best",
+                "concurrent_fragment_downloads": 8,
+                "socket_timeout": 8,
                 "outtmpl": str(CACHE_DIR / "%(id)s.%(ext)s"),
                 "postprocessors": [
                     {
@@ -123,18 +123,11 @@ def search_song(query: str, download: bool = False) -> dict[str, Any]:
             }
         )
 
-    client_profiles = (
-        (None, "bestaudio/best"),
-        (["web_safari"], "best[ext=mp4]/best"),
-        (["android_vr"], "best"),
-        (["ios"], "best[ext=mp4]/best"),
-    )
+    client_profiles = (None, ["web_safari"], ["android_vr"])
     last_error: Exception | None = None
-    for attempt, (client_profile, format_selector) in enumerate(client_profiles):
+    for attempt, client_profile in enumerate(client_profiles):
         try:
             attempt_options = options.copy()
-            if download:
-                attempt_options["format"] = format_selector
             if client_profile is not None:
                 attempt_options["extractor_args"] = {
                     "youtube": {"player_client": client_profile},
@@ -152,7 +145,7 @@ def search_song(query: str, download: bool = False) -> dict[str, Any]:
                 len(client_profiles),
                 error,
             )
-            time.sleep(2)
+            time.sleep(0.5)
     else:
         raise last_error or RuntimeError("فشل طلب YouTube")
 
