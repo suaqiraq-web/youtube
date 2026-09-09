@@ -91,6 +91,7 @@ def search_song(query: str, download: bool = False) -> dict[str, Any]:
         "default_search": "ytsearch1",
         "extractaudio": True,
         "audioformat": "mp3",
+        "cookiefile": str(Path("cookies.txt")),
     }
     if download:
         options.update(
