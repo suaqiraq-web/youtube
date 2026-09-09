@@ -101,6 +101,9 @@ def search_song(query: str, download: bool = False) -> dict[str, Any]:
         "force_ipv4": True,
         "js_runtimes": {"deno": {}},
     }
+    if not download:
+        # البحث عن النتيجة فقط؛ لا تطلب صيغ الفيديو قبل بدء التنزيل.
+        options["extract_flat"] = "in_playlist"
     if COOKIES_PATH.is_file():
         options["cookiefile"] = str(COOKIES_PATH)
     if download:
