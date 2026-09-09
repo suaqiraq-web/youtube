@@ -5,6 +5,7 @@ import os
 import re
 import subprocess
 import time
+from collections import deque
 from pathlib import Path
 from typing import Any
 
@@ -15,10 +16,11 @@ from dotenv import load_dotenv
 from pyrogram import Client
 from pytgcalls import GroupCallFactory
 from pytgcalls.implementation.group_call_file import GroupCallFile
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import ChatPermissions, InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ChatType
 from telegram.ext import (
     Application,
+    ApplicationHandlerStop,
     CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
@@ -58,11 +60,26 @@ CACHE_DIR = Path(os.getenv("CACHE_DIR", "cache"))
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
 COOKIES_PATH = BASE_DIR / "cookies.txt"
 AUDIO_FILE_IDS_PATH = CACHE_DIR / "audio_file_ids.json"
+WARNINGS_PATH = CACHE_DIR / "warnings.json"
+BAD_WORDS_PATH = BASE_DIR / "bad_words.txt"
 
 try:
     AUDIO_FILE_IDS: dict[str, str] = json.loads(AUDIO_FILE_IDS_PATH.read_text(encoding="utf-8"))
 except (FileNotFoundError, json.JSONDecodeError):
     AUDIO_FILE_IDS = {}
+
+try:
+    raw_warnings = json.loads(WARNINGS_PATH.read_text(encoding="utf-8"))
+    if isinstance(raw_warnings, dict):
+        WARNINGS: dict[str, int] = {
+            str(key): max(0, int(value))
+            for key, value in raw_warnings.items()
+            if int(value) > 0
+        }
+    else:
+        WARNINGS = {}
+except (FileNotFoundError, json.JSONDecodeError, TypeError, ValueError):
+    WARNINGS = {}
 
 voice_client: Client | None = None
 voice_clients: list[Client] = []
@@ -70,6 +87,74 @@ voice_client_users: dict[Client, Any] = {}
 voice_calls: Any | None = None
 voice_calls_by_group: dict[int, Any] = {}
 voice_clients_by_group: dict[int, Client] = {}
+
+
+def normalize_moderation_text(text: str) -> str:
+    """توحيد النص قبل فحص الكلمات مع الحفاظ على حدود الكلمات."""
+    text = text.casefold().replace("ـ", "")
+    text = re.sub(r"[\u064B-\u065F\u0670]", "", text)
+    text = text.translate(str.maketrans("إأآٱى", "ااااي"))
+    return re.sub(r"\s+", " ", text).strip()
+
+
+class BadWordsMatcher:
+    """بحث متعدد الكلمات في مرور واحد باستخدام Aho-Corasick."""
+
+    def __init__(self, words: list[str]) -> None:
+        self.transitions: list[dict[str, int]] = [{}]
+        self.failures: list[int] = [0]
+        self.outputs: list[bool] = [False]
+        for word in words:
+            node = 0
+            for character in word:
+                if character not in self.transitions[node]:
+                    self.transitions[node][character] = len(self.transitions)
+                    self.transitions.append({})
+                    self.failures.append(0)
+                    self.outputs.append(False)
+                node = self.transitions[node][character]
+            self.outputs[node] = True
+
+        queue = deque()
+        for node in self.transitions[0].values():
+            queue.append(node)
+        while queue:
+            node = queue.popleft()
+            for character, child in self.transitions[node].items():
+                fallback = self.failures[node]
+                while fallback and character not in self.transitions[fallback]:
+                    fallback = self.failures[fallback]
+                self.failures[child] = self.transitions[fallback].get(character, 0)
+                self.outputs[child] |= self.outputs[self.failures[child]]
+                queue.append(child)
+
+    def contains_bad_word(self, text: str) -> bool:
+        node = 0
+        for character in text:
+            while node and character not in self.transitions[node]:
+                node = self.failures[node]
+            node = self.transitions[node].get(character, 0)
+            if self.outputs[node]:
+                return True
+        return False
+
+
+def load_bad_words() -> BadWordsMatcher:
+    try:
+        lines = BAD_WORDS_PATH.read_text(encoding="utf-8").splitlines()
+    except FileNotFoundError:
+        lines = []
+    words = {
+        normalize_moderation_text(line)
+        for line in lines
+        if line.strip() and not line.lstrip().startswith("#")
+    }
+    words.discard("")
+    logger.info("Loaded %s moderation terms", len(words))
+    return BadWordsMatcher(sorted(words, key=len, reverse=True))
+
+
+BAD_WORDS_MATCHER = load_bad_words()
 
 
 def build_voice_panel(group_id: int) -> InlineKeyboardMarkup:
@@ -91,7 +176,7 @@ def search_song(query: str, download: bool = False) -> dict[str, Any]:
         "quiet": True,
         "no_warnings": True,
         "noplaylist": True,
-        "default_search": "ytsearch1",
+        "default_search": "ytsearch5",
         "extractaudio": True,
         "audioformat": "mp3",
         "extractor_retries": 2,
@@ -104,12 +189,12 @@ def search_song(query: str, download: bool = False) -> dict[str, Any]:
     if not download:
         # البحث عن النتيجة فقط؛ لا تطلب صيغ الفيديو قبل بدء التنزيل.
         options["extract_flat"] = "in_playlist"
-    if COOKIES_PATH.is_file():
+    if COOKIES_PATH.is_file() and os.getenv("USE_YOUTUBE_COOKIES", "0") == "1":
         options["cookiefile"] = str(COOKIES_PATH)
     if download:
         options.update(
             {
-                "format": "worstaudio/bestaudio/best",
+                "format": "bestaudio[ext=m4a]/bestaudio/best",
                 "concurrent_fragment_downloads": 8,
                 "socket_timeout": 8,
                 "outtmpl": str(CACHE_DIR / "%(id)s.%(ext)s"),
@@ -117,20 +202,27 @@ def search_song(query: str, download: bool = False) -> dict[str, Any]:
                     {
                         "key": "FFmpegExtractAudio",
                         "preferredcodec": "mp3",
-                        "preferredquality": "64",
+                        "preferredquality": "128",
                     },
                 ],
                 "postprocessor_args": {
-                    "ExtractAudio": ["-ac", "1"],
+                    "ExtractAudio": ["-ac", "2", "-ar", "44100"],
                 },
             }
         )
+
+    is_youtube_url = bool(re.match(r"^https?://(?:www\.)?(?:youtube\.com|youtu\.be)/", query, re.IGNORECASE))
+    lookup_options = options
+    if download and not is_youtube_url:
+        lookup_options = options.copy()
+        lookup_options["extract_flat"] = "in_playlist"
+        lookup_options["skip_download"] = True
 
     client_profiles = (None, ["web_safari"], ["android_vr"])
     last_error: Exception | None = None
     for attempt, client_profile in enumerate(client_profiles):
         try:
-            attempt_options = options.copy()
+            attempt_options = lookup_options.copy()
             if client_profile is not None:
                 # لا تعيد استخدام كوكيز قديمة مع العملاء البدلاء؛ قد تسبب 403.
                 attempt_options.pop("cookiefile", None)
@@ -160,7 +252,21 @@ def search_song(query: str, download: bool = False) -> dict[str, Any]:
         entries = [entry for entry in info["entries"] if entry]
         if not entries:
             raise ValueError("لم يتم العثور على نتيجة")
-        return entries[0]
+        if not download:
+            return entries[0]
+
+        # جرّب النتائج التالية إذا كانت أول نتيجة محجوبة أو غير قابلة للتنزيل.
+        for entry in entries:
+            try:
+                entry_url = entry.get("webpage_url") or entry.get("url")
+                if not entry_url:
+                    continue
+                with yt_dlp.YoutubeDL(options) as downloader:
+                    return downloader.extract_info(entry_url, download=True)
+            except Exception as error:
+                last_error = error
+                logger.warning("تعذر تنزيل نتيجة YouTube، تجربة النتيجة التالية: %s", error)
+        raise last_error or ValueError("تعذر تنزيل أي نتيجة")
     return info
 
 
@@ -265,6 +371,8 @@ def convert_to_voice_wav(input_path: Path) -> Path:
 
     if input_path.suffix.lower() == ".wav":
         return input_path
+    if output_path.is_file() and output_path.stat().st_mtime >= input_path.stat().st_mtime:
+        return output_path
 
     try:
         subprocess.run(
@@ -276,6 +384,9 @@ def convert_to_voice_wav(input_path: Path) -> Path:
                 "-acodec", "pcm_s16le",
                 "-ar", "48000",
                 "-ac", "2",
+                "-threads", "0",
+                "-loglevel", "error",
+                "-nostdin",
                 str(output_path),
             ],
             check=True,
@@ -312,6 +423,172 @@ async def is_group_admin(user_id: int, group_id: int, context: ContextTypes.DEFA
         return False
 
 
+def warning_key(chat_id: int, user_id: int) -> str:
+    return f"{chat_id}:{user_id}"
+
+
+def save_warnings() -> None:
+    
+    WARNINGS_PATH.write_text(
+        json.dumps(WARNINGS, ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+
+async def get_protection_target(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Any | None:
+    """الحصول على العضو المستهدف من الرد أو منشن تيليجرام الحقيقي."""
+    message = update.effective_message
+    chat = update.effective_chat
+    if not message or not chat:
+        return None
+
+    target = message.reply_to_message.from_user if message.reply_to_message else None
+    if target is None:
+        for entity in message.entities or []:
+            if entity.type == "text_mention" and entity.user is not None:
+                target = entity.user
+                break
+
+    if target is None:
+        await message.reply_text("⚠️ رد على رسالة العضو أو استخدم منشن تيليجرام حقيقي.")
+        return None
+    if target.is_bot:
+        await message.reply_text("⚠️ لا يمكن تطبيق الإجراء على بوت.")
+        return None
+
+    try:
+        member = await context.bot.get_chat_member(chat.id, target.id)
+    except Exception:
+        await message.reply_text("❌ لم أستطع العثور على هذا العضو في المجموعة.")
+        return None
+    if member.status in {"administrator", "creator"}:
+        await message.reply_text("⚠️ لا يمكن تطبيق الإجراء على مشرف.")
+        return None
+    return target
+
+
+async def mute_member(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.effective_message
+    if not message or not await is_admin(update, context):
+        return
+    target = await get_protection_target(update, context)
+    if target is None:
+        return
+    try:
+        await context.bot.restrict_chat_member(
+            chat_id=message.chat.id,
+            user_id=target.id,
+            permissions=ChatPermissions(can_send_messages=False),
+        )
+        await message.reply_text(f"🔇 تم كتم {target.first_name}.")
+    except Exception:
+        logger.exception("Could not mute user %s in chat %s", target.id, message.chat.id)
+        await message.reply_text("❌ لم أستطع كتم العضو. تأكد أن البوت مشرف ولديه صلاحية تقييد الأعضاء.")
+
+
+async def unmute_member(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.effective_message
+    if not message or not await is_admin(update, context):
+        return
+    target = await get_protection_target(update, context)
+    if target is None:
+        return
+    try:
+        await context.bot.restrict_chat_member(
+            chat_id=message.chat.id,
+            user_id=target.id,
+            permissions=ChatPermissions.all_permissions(),
+        )
+        await message.reply_text(f"🔊 تم رفع الكتم عن {target.first_name}.")
+    except Exception:
+        logger.exception("Could not unmute user %s in chat %s", target.id, message.chat.id)
+        await message.reply_text("❌ لم أستطع رفع الكتم. تأكد من صلاحيات البوت.")
+
+
+async def warn_member(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.effective_message
+    if not message or not await is_admin(update, context):
+        return
+    target = await get_protection_target(update, context)
+    if target is None:
+        return
+
+    key = warning_key(message.chat.id, target.id)
+    count = WARNINGS.get(key, 0) + 1
+    WARNINGS[key] = count
+    save_warnings()
+
+    if count < 3:
+        await message.reply_text(f"⚠️ تم تحذير {target.first_name}. التحذيرات: {count}/3")
+        return
+
+    try:
+        await context.bot.restrict_chat_member(
+            chat_id=message.chat.id,
+            user_id=target.id,
+            permissions=ChatPermissions(can_send_messages=False),
+        )
+        await message.reply_text(f"🔇 وصل {target.first_name} إلى 3 تحذيرات وتم كتمه.")
+    except Exception:
+        logger.exception("Could not auto-mute user %s in chat %s", target.id, message.chat.id)
+        await message.reply_text(
+            f"⚠️ وصل {target.first_name} إلى 3 تحذيرات، لكن تعذر كتمه. تأكد من صلاحيات البوت."
+        )
+
+
+async def unwarn_member(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.effective_message
+    if not message or not await is_admin(update, context):
+        return
+    target = await get_protection_target(update, context)
+    if target is None:
+        return
+
+    key = warning_key(message.chat.id, target.id)
+    count = max(0, WARNINGS.get(key, 0) - 1)
+    if count:
+        WARNINGS[key] = count
+    else:
+        WARNINGS.pop(key, None)
+    save_warnings()
+    await message.reply_text(f"✅ تم رفع تحذير عن {target.first_name}. التحذيرات: {count}/3")
+
+
+async def clear_warnings(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.effective_message
+    if not message or not await is_admin(update, context):
+        return
+    target = await get_protection_target(update, context)
+    if target is None:
+        return
+    WARNINGS.pop(warning_key(message.chat.id, target.id), None)
+    save_warnings()
+    await message.reply_text(f"✅ تم رفع كل التحذيرات عن {target.first_name}.")
+
+
+async def moderate_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """حذف الرسائل المسيئة من الأعضاء مع إبقاء رسائل المشرفين."""
+    message = update.effective_message
+    user = update.effective_user
+    chat = update.effective_chat
+    if not message or not user or not chat or not message.text:
+        return
+    if not BAD_WORDS_MATCHER.contains_bad_word(normalize_moderation_text(message.text)):
+        return
+
+    try:
+        member = await context.bot.get_chat_member(chat.id, user.id)
+        if member.status in {"administrator", "creator"}:
+            return
+        await message.delete()
+        logger.info("Deleted a moderation match from user %s in chat %s", user.id, chat.id)
+    except Exception:
+        logger.exception("Could not moderate message in chat %s", chat.id)
+        return
+
+    raise ApplicationHandlerStop
+
+
 async def send_download_audio(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """تنزيل الأغنية وإرسالها كملف صوتي."""
     message = update.effective_message
@@ -341,12 +618,16 @@ async def send_download_audio(update: Update, context: ContextTypes.DEFAULT_TYPE
         if sent_audio.audio:
             await asyncio.to_thread(save_audio_file_id, query, sent_audio.audio.file_id)
         await status.delete()
-    except Exception:
+    except Exception as error:
         logger.exception("Song search failed")
         try:
             await status.delete()
         except Exception:
             pass
+        await message.reply_text(
+            "❌ ما كدرت أحمّل هاي الأغنية. جرّب اسمًا أوضح أو أرسل رابط YouTube مباشر.\n"
+            f"التفاصيل: {str(error)[:180]}"
+        )
 
 
 async def show_commands(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -369,7 +650,12 @@ async def show_commands(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             "/skip - تخطي الأغنية\n"
             "/stop - إنهاء التشغيل\n"
             "/volume 50 - ضبط مستوى الصوت\n"
-            "/clean - تنظيف ملفات الكاش"
+            "/clean - تنظيف ملفات الكاش\n\n"
+            "كتم - كتم العضو بالرد على رسالته\n"
+            "رفع كتم - رفع الكتم\n"
+            "تحذير - إضافة تحذير\n"
+            "رفع تحذير - حذف تحذير واحد\n"
+            "مسح تحذيرات - حذف كل التحذيرات"
         )
     else:
         commands = (
@@ -414,7 +700,12 @@ async def play_song(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                     break
 
         if cached_path is None:
-            song = await asyncio.to_thread(search_song, query, True)
+            download_query = (
+                song_url
+                if (song_url := info.get("webpage_url") or info.get("url"))
+                else query
+            )
+            song = await asyncio.to_thread(search_song, download_query, True)
             audio_path = await asyncio.to_thread(downloaded_audio, song)
         else:
             song = info
@@ -637,7 +928,7 @@ async def clean_cache_command(update: Update, context: ContextTypes.DEFAULT_TYPE
     
     deleted = 0
     for file in CACHE_DIR.glob("*"):
-        if file.is_file() and file.suffix.lower() in {".mp3", ".m4a", ".webm", ".opus"}:
+        if file.is_file() and file.suffix.lower() in {".mp3", ".m4a", ".webm", ".opus", ".wav"}:
             try:
                 file.unlink()
                 deleted += 1
@@ -716,8 +1007,39 @@ def build_application() -> Application:
         control_call
     ))
     application.add_handler(CommandHandler("clean", clean_cache_command))
+    application.add_handler(CommandHandler("mute", mute_member))
+    application.add_handler(CommandHandler("unmute", unmute_member))
+    application.add_handler(CommandHandler("warn", warn_member))
+    application.add_handler(CommandHandler("unwarn", unwarn_member))
+    application.add_handler(CommandHandler("clearwarnings", clear_warnings))
+
+    application.add_handler(MessageHandler(
+        filters.Regex(r"^كتم(?:\s+.+)?$") & filters.TEXT & filters.ChatType.GROUPS,
+        mute_member,
+    ))
+    application.add_handler(MessageHandler(
+        filters.Regex(r"^رفع كتم(?:\s+.+)?$") & filters.TEXT & filters.ChatType.GROUPS,
+        unmute_member,
+    ))
+    application.add_handler(MessageHandler(
+        filters.Regex(r"^تحذير(?:\s+.+)?$") & filters.TEXT & filters.ChatType.GROUPS,
+        warn_member,
+    ))
+    application.add_handler(MessageHandler(
+        filters.Regex(r"^رفع تحذير(?:\s+.+)?$") & filters.TEXT & filters.ChatType.GROUPS,
+        unwarn_member,
+    ))
+    application.add_handler(MessageHandler(
+        filters.Regex(r"^مسح تحذيرات(?:\s+.+)?$") & filters.TEXT & filters.ChatType.GROUPS,
+        clear_warnings,
+    ))
 
     # عرض الأوامر حسب صلاحية المستخدم
+    application.add_handler(MessageHandler(
+        filters.TEXT & filters.ChatType.GROUPS,
+        moderate_message,
+    ), group=-1)
+
     application.add_handler(MessageHandler(
         filters.Regex(r"^الاوامر$") & filters.TEXT,
         show_commands
