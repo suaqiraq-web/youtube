@@ -105,7 +105,7 @@ def search_song(query: str, download: bool = False) -> dict[str, Any]:
     if download:
         options.update(
             {
-                "format": "worstaudio[abr<=64]/worstaudio[abr<=96]/worstaudio",
+                "format": "worstaudio[abr<=64]/worstaudio[abr<=96]/worstaudio/bestaudio/best",
                 "concurrent_fragment_downloads": 4,
                 "socket_timeout": 10,
                 "outtmpl": str(CACHE_DIR / "%(id)s.%(ext)s"),
