@@ -261,6 +261,12 @@ def format_song_duration(duration: Any) -> str:
     return f"{minutes}:{seconds:02d}"
 
 
+def control_user_label(user: Any) -> str:
+    if user and user.username:
+        return f"@{user.username}"
+    return user.first_name if user and user.first_name else "مشرف"
+
+
 def save_audio_file_id(query: str, file_id: str) -> None:
     """حفظ معرف الملف حتى يعاد إرساله من تيليجرام بدون رفع جديد."""
     AUDIO_FILE_IDS[normalized_query(query)] = file_id
@@ -802,6 +808,7 @@ async def control_call(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         return
 
     try:
+        controller = control_user_label(message.from_user)
         text = message.text.strip().casefold()
 
         command_aliases = {
@@ -816,21 +823,21 @@ async def control_call(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
         if text in {"/pause", "pause"}:
             group_call.pause_playout()
-            await message.reply_text("⏸️ تم إيقاف التشغيل مؤقتاً.")
+            await message.reply_text(f"⏸️ تم إيقاف التشغيل مؤقتاً بواسطة {controller}.")
 
         elif text in {"/resume", "resume"}:
             group_call.resume_playout()
-            await message.reply_text("▶️ تم تشغيل الأغنية.")
+            await message.reply_text(f"▶️ تم تشغيل الأغنية بواسطة {controller}.")
 
         elif text in {"/skip", "skip"}:
             await group_call.stop()
             voice_calls_by_group.pop(group_id, None)
-            await message.reply_text("⏭️ تم تخطي الأغنية.")
+            await message.reply_text(f"⏭️ تم تخطي الأغنية بواسطة {controller}.")
 
         elif text in {"/stop", "stop"}:
             await group_call.stop()
             voice_calls_by_group.pop(group_id, None)
-            await message.reply_text("⏹️ تم إنهاء التشغيل.")
+            await message.reply_text(f"⏹️ تم إنهاء التشغيل بواسطة {controller}.")
 
         elif text == "/volume":
             if not context.args:
@@ -892,18 +899,19 @@ async def handle_voice_button(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
 
     try:
+        controller = control_user_label(query.from_user)
         if parts[0] == "voice_pause":
             group_call.pause_playout()
-            await query.answer("⏸️ تم إيقاف التشغيل مؤقتاً.")
+            await query.answer(f"⏸️ أوقف التشغيل مؤقتاً: {controller}")
             await query.edit_message_reply_markup(reply_markup=build_voice_panel(group_id))
         elif parts[0] == "voice_resume":
             group_call.resume_playout()
-            await query.answer("▶️ تم تشغيل الأغنية.")
+            await query.answer(f"▶️ شغّل الأغنية: {controller}")
             await query.edit_message_reply_markup(reply_markup=build_voice_panel(group_id))
         elif parts[0] == "voice_skip":
             await group_call.stop()
             voice_calls_by_group.pop(group_id, None)
-            await query.answer("⏭️ تم تخطي الأغنية.")
+            await query.answer(f"⏭️ تخطى الأغنية: {controller}")
             await query.edit_message_reply_markup(reply_markup=build_voice_panel(group_id))
     except Exception as e:
         logger.exception("Callback voice control failed")
