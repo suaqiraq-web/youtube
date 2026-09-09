@@ -4,6 +4,7 @@ import logging
 import os
 import re
 import subprocess
+import time
 from pathlib import Path
 from typing import Any
 
@@ -93,6 +94,11 @@ def search_song(query: str, download: bool = False) -> dict[str, Any]:
         "default_search": "ytsearch1",
         "extractaudio": True,
         "audioformat": "mp3",
+        "extractor_retries": 5,
+        "fragment_retries": 5,
+        "retries": 5,
+        "sleep_interval_requests": 1,
+        "force_ipv4": True,
     }
     if COOKIES_PATH.is_file():
         options["cookiefile"] = str(COOKIES_PATH)
@@ -101,7 +107,6 @@ def search_song(query: str, download: bool = False) -> dict[str, Any]:
             {
                 "format": "worstaudio[abr<=64]/worstaudio[abr<=96]/worstaudio",
                 "concurrent_fragment_downloads": 4,
-                "retries": 3,
                 "socket_timeout": 10,
                 "outtmpl": str(CACHE_DIR / "%(id)s.%(ext)s"),
                 "postprocessors": [
@@ -117,8 +122,20 @@ def search_song(query: str, download: bool = False) -> dict[str, Any]:
             }
         )
 
-    with yt_dlp.YoutubeDL(options) as downloader:
-        info = downloader.extract_info(query, download=download)
+    last_error: Exception | None = None
+    for attempt in range(3):
+        try:
+            with yt_dlp.YoutubeDL(options) as downloader:
+                info = downloader.extract_info(query, download=download)
+            break
+        except Exception as error:
+            last_error = error
+            if attempt == 2:
+                raise
+            logger.warning("YouTube request failed (%s/3): %s", attempt + 1, error)
+            time.sleep(2)
+    else:
+        raise last_error or RuntimeError("فشل طلب YouTube")
 
     if not info:
         raise ValueError("لم يتم العثور على نتيجة")
