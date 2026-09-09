@@ -122,17 +122,28 @@ def search_song(query: str, download: bool = False) -> dict[str, Any]:
             }
         )
 
+    client_profiles = (None, ["web_safari"], ["android_vr"], ["ios"])
     last_error: Exception | None = None
-    for attempt in range(3):
+    for attempt, client_profile in enumerate(client_profiles):
         try:
-            with yt_dlp.YoutubeDL(options) as downloader:
+            attempt_options = options.copy()
+            if client_profile is not None:
+                attempt_options["extractor_args"] = {
+                    "youtube": {"player_client": client_profile},
+                }
+            with yt_dlp.YoutubeDL(attempt_options) as downloader:
                 info = downloader.extract_info(query, download=download)
             break
         except Exception as error:
             last_error = error
-            if attempt == 2:
+            if attempt == len(client_profiles) - 1:
                 raise
-            logger.warning("YouTube request failed (%s/3): %s", attempt + 1, error)
+            logger.warning(
+                "YouTube request failed (%s/%s), retrying with another client: %s",
+                attempt + 1,
+                len(client_profiles),
+                error,
+            )
             time.sleep(2)
     else:
         raise last_error or RuntimeError("فشل طلب YouTube")
