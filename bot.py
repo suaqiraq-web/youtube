@@ -132,6 +132,8 @@ def search_song(query: str, download: bool = False) -> dict[str, Any]:
         try:
             attempt_options = options.copy()
             if client_profile is not None:
+                # لا تعيد استخدام كوكيز قديمة مع العملاء البدلاء؛ قد تسبب 403.
+                attempt_options.pop("cookiefile", None)
                 attempt_options["extractor_args"] = {
                     "youtube": {"player_client": client_profile},
                 }
