@@ -175,7 +175,7 @@ SUBSCRIPTION_CACHE: dict[tuple[int, int, str], tuple[float, bool]] = {}
 MEMBERSHIP_CACHE_TTL = 60
 YOUTUBE_SEARCH_LIMIT = max(1, int(os.getenv("YOUTUBE_SEARCH_LIMIT", "8")))
 YOUTUBE_DOWNLOAD_CANDIDATE_LIMIT = max(1, int(os.getenv("YOUTUBE_DOWNLOAD_CANDIDATE_LIMIT", "4")))
-YOUTUBE_AUTH_ERROR_LIMIT = max(1, int(os.getenv("YOUTUBE_AUTH_ERROR_LIMIT", "2")))
+YOUTUBE_AUTH_ERROR_LIMIT = max(1, int(os.getenv("YOUTUBE_AUTH_ERROR_LIMIT", "100")))
 YOUTUBE_AUTH_MESSAGE = (
     "يوتيوب طلب تحقق. حدّث cookies.txt من حساب يوتيوب شغال، "
     "أو عطّل الكوكيز مؤقتاً عبر USE_YOUTUBE_COOKIES=0."
@@ -323,8 +323,18 @@ def channel_join_url(channel: str) -> str:
     return channel
 
 
+def normalize_forced_channel(value: str) -> str:
+    value = value.strip()
+    match = re.search(r"(?:https?://)?t\.me/(?:joinchat/|\+)?([A-Za-z0-9_]{5,})/?", value, flags=re.IGNORECASE)
+    if match:
+        return f"@{match.group(1)}"
+    if re.fullmatch(r"[A-Za-z0-9_]{5,}", value):
+        return f"@{value}"
+    return value
+
+
 def forced_channel_label(channel: str) -> str:
-    channel = channel.strip()
+    channel = normalize_forced_channel(channel)
     if channel.startswith("@"):
         return channel
     if re.fullmatch(r"[A-Za-z0-9_]{5,}", channel):
@@ -334,7 +344,15 @@ def forced_channel_label(channel: str) -> str:
 
 def forced_channel(chat_id: int) -> str | None:
     value = chat_settings(chat_id).get("forced_channel")
-    return value if isinstance(value, str) and value.strip() else None
+    return normalize_forced_channel(value) if isinstance(value, str) and value.strip() else None
+
+
+def forced_channel_id(chat_id: int) -> int | None:
+    value = chat_settings(chat_id).get("forced_channel_id")
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
 
 
 async def is_privileged_in_chat(
@@ -379,6 +397,32 @@ async def has_forced_subscription(
     except Exception:
         logger.warning("Could not verify forced subscription for %s in %s", user_id, channel)
         return write_bool_cache(SUBSCRIPTION_CACHE, cache_key, False)
+
+
+async def validate_forced_subscription_target(
+    channel: str,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> tuple[str, int | None, str | None]:
+    target = normalize_forced_channel(channel)
+    try:
+        chat = await context.bot.get_chat(target)
+        bot_member = await context.bot.get_chat_member(chat.id, context.bot.id)
+    except Exception as error:
+        logger.warning("Forced subscription target is not accessible: %s", error)
+        return target, None, "ما أكدر أوصل للقناة/الكروب. أضف البوت هناك أولاً، ويفضّل تخليه مشرف، بعدها فعّل الاشتراك الإجباري."
+
+    if bot_member.status in {"left", "kicked"}:
+        return target, chat.id, "البوت مو مضاف بالقناة/الكروب المطلوب."
+    title = getattr(chat, "title", None) or getattr(chat, "username", None) or target
+    return target, chat.id, None
+
+
+def clear_forced_subscription_cache(chat_id: int, user_id: int | None = None) -> None:
+    channel = forced_channel(chat_id)
+    for key in list(SUBSCRIPTION_CACHE):
+        key_chat_id, key_user_id, key_channel = key
+        if key_chat_id == chat_id and (user_id is None or key_user_id == user_id) and (channel is None or key_channel == channel):
+            SUBSCRIPTION_CACHE.pop(key, None)
 
 
 def normalize_moderation_text(text: str) -> str:
@@ -472,6 +516,7 @@ def is_youtube_auth_error(error: Exception) -> bool:
             "cookies",
             "authentication",
             "confirm you",
+            "page needs to be reloaded",
         )
     )
 
@@ -517,8 +562,8 @@ def youtube_player_clients(use_cookies: bool) -> list[str]:
     if configured:
         return [client.strip() for client in configured.split(",") if client.strip()]
     if use_cookies:
-        return ["web_embedded", "tv", "tv_downgraded", "web"]
-    return ["android", "tv", "web_embedded", "web"]
+        return ["web", "web_embedded", "tv", "tv_downgraded", "android"]
+    return ["android", "ios", "tv", "web_embedded", "web"]
 
 
 def youtube_options(use_cookies: bool) -> dict[str, Any]:
@@ -617,9 +662,8 @@ def search_song(query: str, download: bool = False) -> dict[str, Any]:
                 if is_youtube_auth_error(error):
                     auth_errors += 1
                     if auth_errors >= YOUTUBE_AUTH_ERROR_LIMIT:
-                        raise YouTubeAuthRequiredError(
-                            YOUTUBE_AUTH_MESSAGE
-                        ) from error
+                        logger.warning("YouTube auth error limit reached after %s attempts", auth_errors)
+                        break
 
     if last_error and is_youtube_auth_error(last_error):
         raise YouTubeAuthRequiredError(
@@ -1015,15 +1059,25 @@ async def owner_management(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         if not channel:
             await message.reply_text("⚠️ ارسل الأمر بهذا الشكل: اشتراك اجباري @channel")
             raise ApplicationHandlerStop
+        channel, channel_id, validation_error = await validate_forced_subscription_target(channel, context)
+        if validation_error:
+            await message.reply_text(f"⚠️ {validation_error}")
+            raise ApplicationHandlerStop
         settings["forced_channel"] = channel
+        if channel_id is not None:
+            settings["forced_channel_id"] = channel_id
         settings["features"]["force_sub"] = True
         SUBSCRIPTION_CACHE.clear()
         save_settings()
-        await message.reply_text(f"✅ تم تفعيل الاشتراك الإجباري على {channel}")
+        await message.reply_text(
+            f"✅ تم تفعيل الاشتراك الإجباري على {forced_channel_label(channel)}\n"
+            "راح يتم فحص كل مستخدم مباشرة عند استخدام البوت أو عند ضغط زر تحققت."
+        )
         raise ApplicationHandlerStop
 
     if "اشتراك اجباري" in normalized:
         settings.pop("forced_channel", None)
+        settings.pop("forced_channel_id", None)
         settings["features"]["force_sub"] = False
         SUBSCRIPTION_CACHE.clear()
         save_settings()
@@ -1044,6 +1098,33 @@ async def activation_guard(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     if text and is_bot_command_text(text):
         await message.reply_text(ACTIVATION_REQUIRED_TEXT)
     raise ApplicationHandlerStop
+
+
+async def forced_subscription_member_update(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    member_update = update.chat_member
+    chat = update.effective_chat
+    if member_update is None or chat is None:
+        return
+    user_id = member_update.new_chat_member.user.id
+    status = member_update.new_chat_member.status
+    username = f"@{chat.username}" if getattr(chat, "username", None) else None
+
+    for group_id_text, settings in SETTINGS.items():
+        if not isinstance(settings, dict):
+            continue
+        try:
+            group_id = int(group_id_text)
+        except ValueError:
+            continue
+        target_id = forced_channel_id(group_id)
+        target_name = forced_channel(group_id)
+        if target_id != chat.id and (not username or target_name != username):
+            continue
+        cache_key = (group_id, user_id, target_name or "")
+        if status in {"left", "kicked"}:
+            SUBSCRIPTION_CACHE[cache_key] = (time.monotonic() + MEMBERSHIP_CACHE_TTL, False)
+        else:
+            SUBSCRIPTION_CACHE[cache_key] = (time.monotonic() + MEMBERSHIP_CACHE_TTL, True)
 
 
 async def forced_subscription_guard(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1974,6 +2055,10 @@ def build_application() -> Application:
 
     application.add_handler(
         ChatMemberHandler(auto_join_voice_clients, ChatMemberHandler.MY_CHAT_MEMBER)
+    )
+    application.add_handler(
+        ChatMemberHandler(forced_subscription_member_update, ChatMemberHandler.CHAT_MEMBER),
+        group=-5,
     )
     application.add_handler(MessageHandler(filters.TEXT, owner_management), group=-4)
     application.add_handler(MessageHandler(filters.ChatType.GROUPS, activation_guard), group=-3)
