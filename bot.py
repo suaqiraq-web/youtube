@@ -7,6 +7,7 @@ import re
 import subprocess
 import time
 from collections import deque
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -64,7 +65,73 @@ CACHE_DIR.mkdir(parents=True, exist_ok=True)
 COOKIES_PATH = BASE_DIR / "cookies.txt"
 AUDIO_FILE_IDS_PATH = CACHE_DIR / "audio_file_ids.json"
 WARNINGS_PATH = CACHE_DIR / "warnings.json"
+WARN_VOTES_PATH = CACHE_DIR / "warn_votes.json"
+SETTINGS_PATH = CACHE_DIR / "settings.json"
 BAD_WORDS_PATH = BASE_DIR / "bad_words.txt"
+BOT_OWNER_IDS = {
+    int(value.strip())
+    for value in re.split(r"[,\s]+", os.getenv("BOT_OWNER_IDS", ""))
+    if value.strip().lstrip("-").isdigit()
+}
+BOT_OWNER_USERNAMES = {
+    value.strip().lstrip("@").casefold()
+    for value in re.split(r"[,\s]+", os.getenv("BOT_OWNER_USERNAMES", "znvsv,fadl22b"))
+    if value.strip()
+}
+
+DEFAULT_FEATURES = {
+    "download": True,
+    "protection": True,
+    "voice": False,
+    "games": False,
+    "force_sub": False,
+}
+FEATURE_LABELS = {
+    "download": "يوت / تنزيل الأغاني",
+    "voice": "شغل / المكالمة الصوتية",
+    "games": "الألعاب",
+    "protection": "الحماية والتحذيرات",
+    "force_sub": "الاشتراك الإجباري",
+}
+FEATURE_ALIASES = {
+    "يوت": "download",
+    "تحميل": "download",
+    "تنزيل": "download",
+    "اغاني": "download",
+    "أغاني": "download",
+    "شغل": "voice",
+    "مكالمة": "voice",
+    "مكالمه": "voice",
+    "صوت": "voice",
+    "العاب": "games",
+    "ألعاب": "games",
+    "حماية": "protection",
+    "الحماية": "protection",
+    "تحذيرات": "protection",
+    "اشتراك": "force_sub",
+    "الاشتراك": "force_sub",
+    "اجباري": "force_sub",
+    "إجباري": "force_sub",
+}
+BOT_COMMAND_PATTERNS = [
+    r"^يوت\s+.+$",
+    r"^شغل\s+.+$",
+    r"^(العاب|ألعاب|الاوامر|كتم|رفع كتم|تحذير|رفع تحذير|مسح تحذيرات)(?:\s+.*)?$",
+    r"^(تخطي|غني|توقف|إيقاف|ايقاف|اوكف)$",
+    r"^/(pause|resume|skip|stop|volume|clean|mute|unmute|warn|unwarn|clearwarnings|games)(?:@\w+)?(?:\s+.*)?$",
+]
+OWNER_COMMAND_RE = re.compile(
+    r"^(تفعيل|الغاء تفعيل|إلغاء تفعيل|ت م|الميزات|حالة الاشتراك|اشتراك اجباري|اشتراك إجباري|حذف اشتراك اجباري|الغاء اشتراك اجباري|إلغاء اشتراك إجباري)(?:\s+.*)?$",
+    flags=re.IGNORECASE,
+)
+ACTIVATION_REQUIRED_TEXT = (
+    "⛔️ تعذّر تفعيل البوت\n\n"
+    "لا يمكن تفعيل البوت إلا بأمر مباشر من أحد مطوّري البوت 🛠️\n\n"
+    "🔐 حفاظًا على أمان النظام وتنظيم الصلاحيات، يرجى التواصل مع أحد المطوّرين لإتمام التفعيل.\n\n"
+    "✦ إدارة وتطوير البوت:\n"
+    "👤 @znvsv — الشمري\n"
+    "👤 @fadl22b — Abu alfadl"
+)
 
 try:
     AUDIO_FILE_IDS: dict[str, str] = json.loads(AUDIO_FILE_IDS_PATH.read_text(encoding="utf-8"))
@@ -84,6 +151,18 @@ try:
 except (FileNotFoundError, json.JSONDecodeError, TypeError, ValueError):
     WARNINGS = {}
 
+try:
+    raw_warn_votes = json.loads(WARN_VOTES_PATH.read_text(encoding="utf-8"))
+    WARN_VOTES: dict[str, dict[str, Any]] = raw_warn_votes if isinstance(raw_warn_votes, dict) else {}
+except (FileNotFoundError, json.JSONDecodeError, TypeError, ValueError):
+    WARN_VOTES = {}
+
+try:
+    raw_settings = json.loads(SETTINGS_PATH.read_text(encoding="utf-8"))
+    SETTINGS: dict[str, Any] = raw_settings if isinstance(raw_settings, dict) else {}
+except (FileNotFoundError, json.JSONDecodeError, TypeError, ValueError):
+    SETTINGS = {}
+
 voice_client: Client | None = None
 voice_clients: list[Client] = []
 voice_client_users: dict[Client, Any] = {}
@@ -91,6 +170,175 @@ voice_calls: Any | None = None
 voice_calls_by_group: dict[int, Any] = {}
 voice_clients_by_group: dict[int, Client] = {}
 game_states: dict[tuple[int, int], dict[str, Any]] = {}
+PRIVILEGE_CACHE: dict[tuple[int, int], tuple[float, bool]] = {}
+SUBSCRIPTION_CACHE: dict[tuple[int, int, str], tuple[float, bool]] = {}
+MEMBERSHIP_CACHE_TTL = 60
+
+
+def now_utc() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def save_settings() -> None:
+    SETTINGS_PATH.write_text(
+        json.dumps(SETTINGS, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+
+def save_warn_votes() -> None:
+    WARN_VOTES_PATH.write_text(
+        json.dumps(WARN_VOTES, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+
+def chat_settings(chat_id: int) -> dict[str, Any]:
+    key = str(chat_id)
+    if key not in SETTINGS or not isinstance(SETTINGS[key], dict):
+        SETTINGS[key] = {}
+    settings = SETTINGS[key]
+    features = settings.get("features")
+    if not isinstance(features, dict):
+        features = {}
+        settings["features"] = features
+    for feature, enabled in DEFAULT_FEATURES.items():
+        features.setdefault(feature, enabled)
+    return settings
+
+
+def parse_datetime(value: Any) -> datetime | None:
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value)
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc)
+    except ValueError:
+        return None
+
+
+def format_datetime(value: datetime | None) -> str:
+    if value is None:
+        return "غير مفعّل"
+    local_time = value.astimezone()
+    return local_time.strftime("%Y-%m-%d %H:%M")
+
+
+def is_chat_active(chat_id: int) -> bool:
+    settings = chat_settings(chat_id)
+    expires_at = parse_datetime(settings.get("expires_at"))
+    return expires_at is not None and expires_at > now_utc()
+
+
+def subscription_plan_duration(text: str, fallback: str = "month") -> tuple[str, timedelta]:
+    normalized = normalize_moderation_text(text)
+    if "اسبوع" in normalized or "سبوع" in normalized or "week" in normalized:
+        return "week", timedelta(days=7)
+    if "شهر" in normalized or "شهري" in normalized or "month" in normalized:
+        return "month", timedelta(days=30)
+    return fallback, timedelta(days=7 if fallback == "week" else 30)
+
+
+def has_subscription_plan(text: str) -> bool:
+    normalized = normalize_moderation_text(text)
+    return any(word in normalized for word in {"اسبوع", "سبوع", "week", "شهر", "شهري", "month"})
+
+
+def feature_enabled(chat_id: int, feature: str) -> bool:
+    return bool(chat_settings(chat_id)["features"].get(feature, False))
+
+
+def feature_from_text(text: str) -> str | None:
+    normalized = normalize_moderation_text(text)
+    for alias, feature in FEATURE_ALIASES.items():
+        if normalize_moderation_text(alias) in normalized:
+            return feature
+    return None
+
+
+def is_bot_command_text(text: str) -> bool:
+    stripped = text.strip()
+    return any(re.match(pattern, stripped, flags=re.IGNORECASE) for pattern in BOT_COMMAND_PATTERNS)
+
+
+def is_bot_owner_user(user: Any) -> bool:
+    if not user:
+        return False
+    if user.id in BOT_OWNER_IDS:
+        return True
+    username = (user.username or "").casefold()
+    return bool(username and username in BOT_OWNER_USERNAMES)
+
+
+def read_bool_cache(cache: dict[Any, tuple[float, bool]], key: Any) -> bool | None:
+    cached = cache.get(key)
+    if cached is None:
+        return None
+    expires_at, value = cached
+    if expires_at < time.monotonic():
+        cache.pop(key, None)
+        return None
+    return value
+
+
+def write_bool_cache(cache: dict[Any, tuple[float, bool]], key: Any, value: bool) -> bool:
+    cache[key] = (time.monotonic() + MEMBERSHIP_CACHE_TTL, value)
+    return value
+
+
+def channel_join_url(channel: str) -> str:
+    channel = channel.strip()
+    if channel.startswith("@"):
+        return f"https://t.me/{channel[1:]}"
+    if re.fullmatch(r"[A-Za-z0-9_]{5,}", channel):
+        return f"https://t.me/{channel}"
+    return channel
+
+
+def forced_channel(chat_id: int) -> str | None:
+    value = chat_settings(chat_id).get("forced_channel")
+    return value if isinstance(value, str) and value.strip() else None
+
+
+async def is_privileged_in_chat(
+    user_id: int,
+    chat_id: int,
+    context: ContextTypes.DEFAULT_TYPE,
+    user: Any = None,
+) -> bool:
+    if is_bot_owner_user(user):
+        return True
+    cache_key = (chat_id, user_id)
+    cached = read_bool_cache(PRIVILEGE_CACHE, cache_key)
+    if cached is not None:
+        return cached
+    try:
+        member = await context.bot.get_chat_member(chat_id, user_id)
+        return write_bool_cache(PRIVILEGE_CACHE, cache_key, member.status in {"administrator", "creator"})
+    except Exception:
+        return write_bool_cache(PRIVILEGE_CACHE, cache_key, False)
+
+
+async def has_forced_subscription(
+    user_id: int,
+    chat_id: int,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> bool:
+    channel = forced_channel(chat_id)
+    if not channel or not feature_enabled(chat_id, "force_sub"):
+        return True
+    cache_key = (chat_id, user_id, channel)
+    cached = read_bool_cache(SUBSCRIPTION_CACHE, cache_key)
+    if cached is not None:
+        return cached
+    try:
+        member = await context.bot.get_chat_member(channel, user_id)
+        return write_bool_cache(SUBSCRIPTION_CACHE, cache_key, member.status not in {"left", "kicked"})
+    except Exception:
+        logger.warning("Could not verify forced subscription for %s in %s", user_id, channel)
+        return write_bool_cache(SUBSCRIPTION_CACHE, cache_key, False)
 
 
 def normalize_moderation_text(text: str) -> str:
@@ -466,6 +714,8 @@ async def is_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
     chat = update.effective_chat
     if not message or not user or not chat or chat.type not in {ChatType.GROUP, ChatType.SUPERGROUP}:
         return False
+    if is_bot_owner_user(user):
+        return True
     try:
         member = await context.bot.get_chat_member(chat.id, user.id)
         return member.status in {"administrator", "creator"}
@@ -475,6 +725,8 @@ async def is_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
 
 async def is_group_admin(user_id: int, group_id: int, context: ContextTypes.DEFAULT_TYPE) -> bool:
     """التحقق من أن المستخدم مشرف في المجموعة المرتبطة باللوحة."""
+    if user_id in BOT_OWNER_IDS:
+        return True
     try:
         member = await context.bot.get_chat_member(group_id, user_id)
         return member.status in {"administrator", "creator"}
@@ -532,9 +784,246 @@ async def get_protection_target(update: Update, context: ContextTypes.DEFAULT_TY
     return target
 
 
+async def owner_management(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.effective_message
+    user = update.effective_user
+    chat = update.effective_chat
+    if not message or not user or not chat or not message.text:
+        return
+    text = message.text.strip()
+    if not OWNER_COMMAND_RE.match(text):
+        return
+
+    if not is_bot_owner_user(user):
+        raise ApplicationHandlerStop
+
+    settings = chat_settings(chat.id)
+    normalized = normalize_moderation_text(text)
+
+    if normalized.startswith("الميزات"):
+        lines = ["⚙️ الميزات:"]
+        for feature, label in FEATURE_LABELS.items():
+            enabled = feature_enabled(chat.id, feature)
+            marker = "✅" if enabled else "❌"
+            extra = ""
+            if feature == "force_sub" and forced_channel(chat.id):
+                extra = f" ({forced_channel(chat.id)})"
+            lines.append(f"{marker} {label}{extra}")
+        expires_at = parse_datetime(settings.get("expires_at"))
+        lines.append("")
+        lines.append(f"⏳ الاشتراك: {format_datetime(expires_at)}")
+        lines.append("استخدم: ت م اسم الميزة")
+        await message.reply_text("\n".join(lines))
+        raise ApplicationHandlerStop
+
+    if normalized.startswith("حالة الاشتراك"):
+        expires_at = parse_datetime(settings.get("expires_at"))
+        status = "مفعّل" if is_chat_active(chat.id) else "متوقف"
+        await message.reply_text(f"🔐 حالة الاشتراك: {status}\n⏳ ينتهي: {format_datetime(expires_at)}")
+        raise ApplicationHandlerStop
+
+    if normalized.startswith("تفعيل"):
+        current_plan = str(settings.get("plan") or "month")
+        renew = "تجديد" in normalized
+        if renew and not has_subscription_plan(text):
+            await message.reply_text("⚠️ استخدم: تفعيل تجديد اسبوع أو تفعيل تجديد شهر")
+            raise ApplicationHandlerStop
+        plan, duration = subscription_plan_duration(text, fallback=current_plan)
+        current_expiry = parse_datetime(settings.get("expires_at"))
+        base_time = max(now_utc(), current_expiry) if renew and current_expiry else now_utc()
+        expires_at = base_time + duration
+        settings["expires_at"] = expires_at.isoformat()
+        settings["plan"] = plan
+        settings["activated_by"] = user.id
+        settings["activated_at"] = now_utc().isoformat()
+        save_settings()
+        action = "تجديد" if renew else "تفعيل"
+        await message.reply_text(
+            f"✅ تم {action} البوت بنجاح.\n"
+            f"📦 النوع: {'أسبوعي' if plan == 'week' else 'شهري'}\n"
+            f"⏳ ينتهي: {format_datetime(expires_at)}"
+        )
+        raise ApplicationHandlerStop
+
+    if normalized.startswith("الغاء تفعيل"):
+        settings.pop("expires_at", None)
+        settings.pop("activated_by", None)
+        settings.pop("activated_at", None)
+        save_settings()
+        await message.reply_text("⛔️ تم إيقاف اشتراك البوت لهذه المحادثة.")
+        raise ApplicationHandlerStop
+
+    if normalized.startswith("ت م"):
+        feature = feature_from_text(text[3:].strip())
+        if feature is None:
+            await message.reply_text("⚠️ اكتب اسم الميزة مثل: يوت، شغل، العاب، حماية، اشتراك.")
+            raise ApplicationHandlerStop
+        if feature == "force_sub" and not forced_channel(chat.id) and not feature_enabled(chat.id, feature):
+            await message.reply_text("⚠️ قبل تفعيل الاشتراك الإجباري استخدم: اشتراك اجباري @channel")
+            raise ApplicationHandlerStop
+        features = settings["features"]
+        features[feature] = not bool(features.get(feature, False))
+        save_settings()
+        state = "تفعيل" if features[feature] else "تعطيل"
+        await message.reply_text(f"✅ تم {state}: {FEATURE_LABELS[feature]}")
+        raise ApplicationHandlerStop
+
+    if normalized.startswith("اشتراك اجباري"):
+        channel = None
+        match = re.search(r"@[\w\d_]{5,}", text)
+        if match:
+            channel = match.group(0)
+        else:
+            parts = text.split(maxsplit=2)
+            if len(parts) >= 3:
+                channel = parts[2].strip()
+        if not channel:
+            await message.reply_text("⚠️ ارسل الأمر بهذا الشكل: اشتراك اجباري @channel")
+            raise ApplicationHandlerStop
+        settings["forced_channel"] = channel
+        settings["features"]["force_sub"] = True
+        save_settings()
+        await message.reply_text(f"✅ تم تفعيل الاشتراك الإجباري على {channel}")
+        raise ApplicationHandlerStop
+
+    if "اشتراك اجباري" in normalized:
+        settings.pop("forced_channel", None)
+        settings["features"]["force_sub"] = False
+        save_settings()
+        await message.reply_text("✅ تم إلغاء الاشتراك الإجباري.")
+        raise ApplicationHandlerStop
+
+
+async def activation_guard(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.effective_message
+    chat = update.effective_chat
+    if not message or not chat or chat.type not in {ChatType.GROUP, ChatType.SUPERGROUP}:
+        return
+    if is_chat_active(chat.id):
+        return
+    text = message.text or ""
+    if OWNER_COMMAND_RE.match(text.strip()) and is_bot_owner_user(update.effective_user):
+        return
+    if text and is_bot_command_text(text):
+        await message.reply_text(ACTIVATION_REQUIRED_TEXT)
+    raise ApplicationHandlerStop
+
+
+async def forced_subscription_guard(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.effective_message
+    user = update.effective_user
+    chat = update.effective_chat
+    if (
+        not message
+        or not user
+        or not chat
+        or chat.type not in {ChatType.GROUP, ChatType.SUPERGROUP}
+        or not is_chat_active(chat.id)
+        or not feature_enabled(chat.id, "force_sub")
+        or not forced_channel(chat.id)
+    ):
+        return
+    if OWNER_COMMAND_RE.match((message.text or "").strip()) and is_bot_owner_user(user):
+        return
+    if await is_privileged_in_chat(user.id, chat.id, context, user=user):
+        return
+    if await has_forced_subscription(user.id, chat.id, context):
+        return
+
+    channel = forced_channel(chat.id) or ""
+    await message.reply_text(
+        "🔐 يجب الاشتراك بالقناة قبل استخدام البوت.",
+        reply_markup=InlineKeyboardMarkup(
+            [[InlineKeyboardButton("اشترك بالقناة", url=channel_join_url(channel))]]
+        ),
+    )
+    raise ApplicationHandlerStop
+
+
+async def callback_preflight(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    if query is None or query.message is None:
+        return
+    chat = query.message.chat
+    if chat.type not in {ChatType.GROUP, ChatType.SUPERGROUP}:
+        return
+    if not is_chat_active(chat.id):
+        await query.answer("⛔️ البوت غير مفعّل. تواصل مع مطوّري البوت.", show_alert=True)
+        raise ApplicationHandlerStop
+    if not feature_enabled(chat.id, "force_sub") or not forced_channel(chat.id):
+        return
+    if await is_privileged_in_chat(query.from_user.id, chat.id, context, user=query.from_user):
+        return
+    if await has_forced_subscription(query.from_user.id, chat.id, context):
+        return
+    await query.answer("🔐 اشترك بالقناة أولاً.", show_alert=True)
+    raise ApplicationHandlerStop
+
+
+async def apply_warning_to_target(
+    message: Any,
+    context: ContextTypes.DEFAULT_TYPE,
+    target: Any,
+    prefix: str = "⚠️ تم تحذير",
+) -> None:
+    key = warning_key(message.chat.id, target.id)
+    count = WARNINGS.get(key, 0) + 1
+    WARNINGS[key] = count
+    save_warnings()
+
+    if count < 3:
+        await message.reply_text(f"{prefix} {target.first_name}. التحذيرات: {count}/3")
+        return
+
+    try:
+        await context.bot.restrict_chat_member(
+            chat_id=message.chat.id,
+            user_id=target.id,
+            permissions=ChatPermissions(can_send_messages=False),
+        )
+        await message.reply_text(
+            f"『⛔️』 تم تقييد {protection_target_label(target)} ⚠️ بسبب مخالفة القوانين\."
+        , parse_mode="MarkdownV2")
+    except Exception:
+        logger.exception("Could not auto-mute user %s in chat %s", target.id, message.chat.id)
+        await message.reply_text(
+            f"⚠️ وصل {target.first_name} إلى 3 تحذيرات، لكن تعذر كتمه. تأكد من صلاحيات البوت."
+        )
+
+
+async def community_warn_vote(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.effective_message
+    user = update.effective_user
+    chat = update.effective_chat
+    if not message or not user or not chat or not feature_enabled(chat.id, "protection"):
+        return
+    target = await get_protection_target(update, context)
+    if target is None:
+        return
+    if target.id == user.id:
+        await message.reply_text("⚠️ لا تستطيع تحذير نفسك.")
+        return
+
+    key = warning_key(chat.id, target.id)
+    vote_state = WARN_VOTES.setdefault(key, {"voters": [], "updated_at": now_utc().isoformat()})
+    voters = {int(voter_id) for voter_id in vote_state.get("voters", []) if str(voter_id).lstrip("-").isdigit()}
+    voters.add(user.id)
+    vote_state["voters"] = sorted(voters)
+    vote_state["updated_at"] = now_utc().isoformat()
+    save_warn_votes()
+
+    if len(voters) < 5:
+        await message.reply_text(f"🗳 تم تسجيل التحذير الجماعي: {len(voters)}/5")
+        return
+
+    WARN_VOTES.pop(key, None)
+    save_warn_votes()
+    await apply_warning_to_target(message, context, target, prefix="⚠️ اكتمل تحذير الأعضاء ضد")
+
+
 async def mute_member(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     message = update.effective_message
-    if not message or not await is_admin(update, context):
+    if not message or not feature_enabled(message.chat.id, "protection") or not await is_admin(update, context):
         return
     target = await get_protection_target(update, context)
     if target is None:
@@ -555,7 +1044,7 @@ async def mute_member(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
 async def unmute_member(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     message = update.effective_message
-    if not message or not await is_admin(update, context):
+    if not message or not feature_enabled(message.chat.id, "protection") or not await is_admin(update, context):
         return
     target = await get_protection_target(update, context)
     if target is None:
@@ -574,40 +1063,20 @@ async def unmute_member(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
 async def warn_member(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     message = update.effective_message
-    if not message or not await is_admin(update, context):
+    if not message or not feature_enabled(message.chat.id, "protection"):
+        return
+    if not await is_admin(update, context):
+        await community_warn_vote(update, context)
         return
     target = await get_protection_target(update, context)
     if target is None:
         return
-
-    key = warning_key(message.chat.id, target.id)
-    count = WARNINGS.get(key, 0) + 1
-    WARNINGS[key] = count
-    save_warnings()
-
-    if count < 3:
-        await message.reply_text(f"⚠️ تم تحذير {target.first_name}. التحذيرات: {count}/3")
-        return
-
-    try:
-        await context.bot.restrict_chat_member(
-            chat_id=message.chat.id,
-            user_id=target.id,
-            permissions=ChatPermissions(can_send_messages=False),
-        )
-        await message.reply_text(
-            f"『⛔️』 تم تقييد {protection_target_label(target)} ⚠️ بسبب مخالفة القوانين\."
-        , parse_mode="MarkdownV2")
-    except Exception:
-        logger.exception("Could not auto-mute user %s in chat %s", target.id, message.chat.id)
-        await message.reply_text(
-            f"⚠️ وصل {target.first_name} إلى 3 تحذيرات، لكن تعذر كتمه. تأكد من صلاحيات البوت."
-        )
+    await apply_warning_to_target(message, context, target)
 
 
 async def unwarn_member(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     message = update.effective_message
-    if not message or not await is_admin(update, context):
+    if not message or not feature_enabled(message.chat.id, "protection") or not await is_admin(update, context):
         return
     target = await get_protection_target(update, context)
     if target is None:
@@ -625,7 +1094,7 @@ async def unwarn_member(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
 async def clear_warnings(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     message = update.effective_message
-    if not message or not await is_admin(update, context):
+    if not message or not feature_enabled(message.chat.id, "protection") or not await is_admin(update, context):
         return
     target = await get_protection_target(update, context)
     if target is None:
@@ -641,6 +1110,8 @@ async def moderate_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     user = update.effective_user
     chat = update.effective_chat
     if not message or not user or not chat or not message.text:
+        return
+    if not feature_enabled(chat.id, "protection"):
         return
     if not BAD_WORDS_MATCHER.contains_bad_word(normalize_moderation_text(message.text)):
         return
@@ -662,6 +1133,8 @@ async def send_download_audio(update: Update, context: ContextTypes.DEFAULT_TYPE
     """تنزيل الأغنية وإرسالها كملف صوتي."""
     message = update.effective_message
     if not message or not message.text:
+        return
+    if not feature_enabled(message.chat.id, "download"):
         return
 
     match = re.match(r"^يوت\s+(.+)$", message.text.strip(), flags=re.IGNORECASE)
@@ -711,35 +1184,47 @@ async def show_commands(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         return
 
     if await is_admin(update, context):
-        commands = (
-            "📋 أوامر المشرفين:\n\n"
-            "يوت اسم الأغنية - تنزيل الأغنية كملف صوتي\n"
-            "شغل اسم الأغنية - تشغيل الأغنية في المكالمة\n"
-            "اوكف - إيقاف الأغنية مؤقتًا\n"
-            "غني - استئناف تشغيل الأغنية\n"
-            "تخطي - تخطي الأغنية\n"
-            "توقف - إنهاء التشغيل\n"
-            "/pause - إيقاف مؤقت\n"
-            "/resume - استئناف التشغيل\n"
-            "/skip - تخطي الأغنية\n"
-            "/stop - إنهاء التشغيل\n"
-            "/volume 50 - ضبط مستوى الصوت\n"
-            "/clean - تنظيف ملفات الكاش\n\n"
-            "العاب أو /games - ألعاب جماعية وترفيهية\n\n"
-            "كتم - كتم العضو بالرد على رسالته\n"
-            "رفع كتم - رفع الكتم\n"
-            "تحذير - إضافة تحذير\n"
-            "رفع تحذير - حذف تحذير واحد\n"
-            "مسح تحذيرات - حذف كل التحذيرات"
-        )
+        command_lines = ["📋 أوامر المشرفين:", ""]
+        if feature_enabled(message.chat.id, "download"):
+            command_lines.append("يوت اسم الأغنية - تنزيل الأغنية كملف صوتي")
+        if feature_enabled(message.chat.id, "voice"):
+            command_lines.extend([
+                "شغل اسم الأغنية - تشغيل الأغنية في المكالمة",
+                "اوكف - إيقاف الأغنية مؤقتًا",
+                "غني - استئناف تشغيل الأغنية",
+                "تخطي - تخطي الأغنية",
+                "توقف - إنهاء التشغيل",
+                "/pause - إيقاف مؤقت",
+                "/resume - استئناف التشغيل",
+                "/skip - تخطي الأغنية",
+                "/stop - إنهاء التشغيل",
+                "/volume 50 - ضبط مستوى الصوت",
+            ])
+        command_lines.append("/clean - تنظيف ملفات الكاش")
+        if feature_enabled(message.chat.id, "games"):
+            command_lines.extend(["", "العاب أو /games - ألعاب جماعية وترفيهية"])
+        if feature_enabled(message.chat.id, "protection"):
+            command_lines.extend([
+                "",
+                "كتم - كتم العضو بالرد على رسالته",
+                "رفع كتم - رفع الكتم",
+                "تحذير - إضافة تحذير",
+                "رفع تحذير - حذف تحذير واحد",
+                "مسح تحذيرات - حذف كل التحذيرات",
+                "الأعضاء: 5 ردود بكلمة تحذير تعطي العضو تحذيرًا رسميًا",
+            ])
+        commands = "\n".join(command_lines)
     else:
-        commands = (
-            "📋 الأوامر المتاحة للأعضاء:\n\n"
-            "يوت اسم الأغنية - تنزيل الأغنية كملف صوتي\n"
-            "العاب - قائمة 10 ألعاب\n"
-            "الاوامر - عرض قائمة الأوامر"
-        )
-
+        command_lines = ["📋 الأوامر المتاحة للأعضاء:", ""]
+        if feature_enabled(message.chat.id, "download"):
+            command_lines.append("يوت اسم الأغنية - تنزيل الأغنية كملف صوتي")
+        if feature_enabled(message.chat.id, "games"):
+            command_lines.append("العاب - قائمة 10 ألعاب")
+        if feature_enabled(message.chat.id, "protection"):
+            command_lines.append("تحذير - بالرد على رسالة العضو، 5 أعضاء = تحذير رسمي")
+        command_lines.append("الاوامر - عرض قائمة الأوامر")
+        commands = "\n".join(command_lines)
+ 
     await message.reply_text(commands)
 
 
@@ -748,6 +1233,8 @@ async def play_song(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     message = update.effective_message
     
     if not message or not message.text:
+        return
+    if not feature_enabled(message.chat.id, "voice"):
         return
     
     if not await is_admin(update, context):
@@ -891,6 +1378,8 @@ async def control_call(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
     if not message:
         return
+    if not feature_enabled(message.chat.id, "voice"):
+        return
 
     if not await is_admin(update, context):
         return
@@ -938,7 +1427,7 @@ async def control_call(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             voice_calls_by_group.pop(group_id, None)
             await message.reply_text(f"⏹️ تم إنهاء التشغيل بواسطة {controller}.")
 
-        elif text == "/volume":
+        elif text.startswith("/volume"):
             if not context.args:
                 await message.reply_text("ℹ️ استخدم: `/volume 50` لتغيير مستوى الصوت (0-100).")
                 return
@@ -959,7 +1448,7 @@ async def control_call(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 async def voice_panel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """لوحة التحكم بالمكالمة الصوتية في المجموعة."""
     message = update.effective_message
-    if not message or not await is_admin(update, context):
+    if not message or not feature_enabled(message.chat.id, "voice") or not await is_admin(update, context):
         return
 
     try:
@@ -988,7 +1477,10 @@ async def handle_voice_button(update: Update, context: ContextTypes.DEFAULT_TYPE
     except ValueError:
         return
 
-    if not await is_group_admin(query.from_user.id, group_id, context):
+    if not feature_enabled(group_id, "voice"):
+        await query.answer("❌ ميزة المكالمة متوقفة حالياً.", show_alert=True)
+        return
+    if not await is_privileged_in_chat(query.from_user.id, group_id, context, user=query.from_user):
         await query.answer("❌ هذا الأمر متاح لمشرفي المجموعة فقط.", show_alert=True)
         return
     
@@ -1039,7 +1531,7 @@ def games_menu() -> InlineKeyboardMarkup:
 
 async def games_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     message = update.effective_message
-    if message:
+    if message and feature_enabled(message.chat.id, "games"):
         await message.reply_text("🎮 اختار لعبة:", reply_markup=games_menu())
 
 
@@ -1102,6 +1594,9 @@ async def handle_game_button(update: Update, context: ContextTypes.DEFAULT_TYPE)
     query = update.callback_query
     if query is None or not query.data:
         return
+    if query.message is not None and not feature_enabled(query.message.chat_id, "games"):
+        await query.answer("❌ ميزة الألعاب متوقفة حالياً.", show_alert=True)
+        return
     parts = query.data.split(":")
     if parts[0] != "game":
         return
@@ -1141,6 +1636,9 @@ async def handle_game_button(update: Update, context: ContextTypes.DEFAULT_TYPE)
 async def finish_game_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     if query is None or not query.data or not query.data.startswith("game:"):
+        return
+    if query.message is not None and not feature_enabled(query.message.chat_id, "games"):
+        await query.answer("❌ ميزة الألعاب متوقفة حالياً.", show_alert=True)
         return
     parts = query.data.split(":")
     if parts[1] in {"menu", "open"}:
@@ -1305,6 +1803,10 @@ def build_application() -> Application:
     application.add_handler(
         ChatMemberHandler(auto_join_voice_clients, ChatMemberHandler.MY_CHAT_MEMBER)
     )
+    application.add_handler(MessageHandler(filters.TEXT, owner_management), group=-4)
+    application.add_handler(MessageHandler(filters.ChatType.GROUPS, activation_guard), group=-3)
+    application.add_handler(CallbackQueryHandler(callback_preflight), group=-3)
+    application.add_handler(MessageHandler(filters.ChatType.GROUPS, forced_subscription_guard), group=-2)
     application.add_handler(CallbackQueryHandler(handle_voice_button, pattern=r"^voice_(pause|resume|skip):"))
     application.add_handler(CallbackQueryHandler(finish_game_callback, pattern=r"^game:"))
     
@@ -1313,6 +1815,7 @@ def build_application() -> Application:
         ["pause", "resume", "skip", "stop", "volume"],
         control_call
     ))
+    application.add_handler(CommandHandler("panel", voice_panel))
     application.add_handler(CommandHandler("clean", clean_cache_command))
     application.add_handler(CommandHandler("mute", mute_member))
     application.add_handler(CommandHandler("unmute", unmute_member))
