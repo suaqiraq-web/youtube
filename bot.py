@@ -173,6 +173,13 @@ game_states: dict[tuple[int, int], dict[str, Any]] = {}
 PRIVILEGE_CACHE: dict[tuple[int, int], tuple[float, bool]] = {}
 SUBSCRIPTION_CACHE: dict[tuple[int, int, str], tuple[float, bool]] = {}
 MEMBERSHIP_CACHE_TTL = 60
+YOUTUBE_SEARCH_LIMIT = max(1, int(os.getenv("YOUTUBE_SEARCH_LIMIT", "8")))
+YOUTUBE_DOWNLOAD_CANDIDATE_LIMIT = max(1, int(os.getenv("YOUTUBE_DOWNLOAD_CANDIDATE_LIMIT", "4")))
+YOUTUBE_AUTH_ERROR_LIMIT = max(1, int(os.getenv("YOUTUBE_AUTH_ERROR_LIMIT", "2")))
+
+
+class YouTubeAuthRequiredError(RuntimeError):
+    pass
 
 
 def now_utc() -> datetime:
@@ -422,74 +429,140 @@ def build_voice_panel(group_id: int) -> InlineKeyboardMarkup:
     )
 
 
-def search_song(query: str, download: bool = False) -> dict[str, Any]:
-    """البحث عن أغنية وتحميلها من يوتيوب"""
+def is_youtube_auth_error(error: Exception) -> bool:
+    text = str(error).casefold()
+    return any(
+        marker in text
+        for marker in (
+            "sign in to confirm",
+            "not a bot",
+            "cookies",
+            "authentication",
+            "confirm you",
+        )
+    )
+
+
+def compact_youtube_error(error: Exception) -> str:
+    text = re.sub(r"\s+", " ", str(error)).strip()
+    return text[:220]
+
+
+def is_probable_url(value: str) -> bool:
+    return bool(re.match(r"^https?://", value.strip(), flags=re.IGNORECASE))
+
+
+def youtube_player_clients(use_cookies: bool) -> list[str]:
+    configured = os.getenv("YOUTUBE_PLAYER_CLIENTS", "").strip()
+    if configured:
+        return [client.strip() for client in configured.split(",") if client.strip()]
+    if use_cookies:
+        return ["web_embedded", "tv", "tv_downgraded", "web"]
+    return ["android", "tv", "web_embedded", "web"]
+
+
+def youtube_options(use_cookies: bool) -> dict[str, Any]:
     options: dict[str, Any] = {
         "quiet": True,
         "no_warnings": True,
         "noplaylist": True,
-        "default_search": "ytsearch500",
-        "extractor_retries": 4,
-        "fragment_retries": 8,
-        "retries": 4,
-        "file_access_retries": 3,
-        "socket_timeout": 30,
-        "concurrent_fragment_downloads": 4,
+        "default_search": f"ytsearch{YOUTUBE_SEARCH_LIMIT}",
+        "extractor_retries": 2,
+        "fragment_retries": 3,
+        "retries": 2,
+        "file_access_retries": 2,
+        "socket_timeout": 15,
+        "concurrent_fragment_downloads": 8,
         "sleep_interval_requests": 0,
         "force_ipv4": True,
-        "format_sort": ["abr", "acodec: opus", "acodec: mp4a", "asr"],
+        "cachedir": str(CACHE_DIR / "yt_dlp_cache"),
+        "skip_unavailable_fragments": True,
+        "extractor_args": {"youtube": {"player_client": youtube_player_clients(use_cookies)}},
+        "format_sort": ["acodec:mp4a", "ext:m4a", "abr:128"],
     }
-    use_cookies = COOKIES_PATH.is_file() and os.getenv("USE_YOUTUBE_COOKIES", "1") != "0"
     if use_cookies:
         options["cookiefile"] = str(COOKIES_PATH)
-    search_options = options.copy()
-    search_options["extract_flat"] = "in_playlist"
+    return options
+
+
+def search_song(query: str, download: bool = False) -> dict[str, Any]:
+    """البحث عن أغنية وتحميلها من يوتيوب"""
+    use_cookies = COOKIES_PATH.is_file() and os.getenv("USE_YOUTUBE_COOKIES", "1") != "0"
+    search_profiles = [youtube_options(use_cookies)]
+    if use_cookies:
+        search_profiles.append(youtube_options(False))
+    search_target = query if is_probable_url(query) else f"ytsearch{YOUTUBE_SEARCH_LIMIT}:{query}"
 
     info = None
     last_search_error: Exception | None = None
-    for attempt in range(2 if use_cookies else 1):
+    for attempt, search_options in enumerate(search_profiles, start=1):
         try:
-            if attempt == 1:
-                search_options.pop("cookiefile", None)
+            search_options = search_options.copy()
+            search_options["extract_flat"] = "in_playlist"
             with yt_dlp.YoutubeDL(search_options) as downloader:
-                info = downloader.extract_info(query, download=False)
+                info = downloader.extract_info(search_target, download=False)
             if info:
                 break
         except Exception as error:
             last_search_error = error
             logger.warning("YouTube search attempt %s failed: %s", attempt + 1, error)
+            if is_youtube_auth_error(error):
+                continue
 
     if not info:
+        if last_search_error and is_youtube_auth_error(last_search_error):
+            raise YouTubeAuthRequiredError(
+                "يوتيوب طلب تحقق. حدّث cookies.txt من حساب يوتيوب شغال أو جرّب USE_YOUTUBE_COOKIES=0."
+            ) from last_search_error
         raise ValueError("لم يتم العثور على الأغنية") from last_search_error
     entries = [entry for entry in info.get("entries", [info]) if entry]
     if not entries:
         raise ValueError("لم يتم العثور على الأغنية")
+    entries = entries[:YOUTUBE_SEARCH_LIMIT]
     if not download:
         return entries[0]
 
-    download_options = options.copy()
-    download_options.update(
-        {
-            "format": "bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio/best",
-            "outtmpl": str(CACHE_DIR / "%(id)s.%(ext)s"),
-            "overwrites": False,
-        }
-    )
+    download_profiles = [youtube_options(use_cookies)]
+    if use_cookies:
+        download_profiles.append(youtube_options(False))
+    for download_options in download_profiles:
+        download_options.update(
+            {
+                "format": "bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio/best",
+                "outtmpl": str(CACHE_DIR / "%(id)s.%(ext)s"),
+                "overwrites": False,
+            }
+        )
+
     last_error: Exception | None = None
-    for entry in entries[:500]:
+    auth_errors = 0
+    for entry in entries[:YOUTUBE_DOWNLOAD_CANDIDATE_LIMIT]:
         entry_url = entry.get("webpage_url") or entry.get("url")
         if not entry_url:
             continue
-        for attempt in range(2 if use_cookies else 1):
+        for attempt, download_options in enumerate(download_profiles, start=1):
             try:
-                if attempt == 1:
-                    download_options.pop("cookiefile", None)
                 with yt_dlp.YoutubeDL(download_options) as downloader:
                     return downloader.extract_info(entry_url, download=True)
             except Exception as error:
                 last_error = error
-                logger.warning("تعذر تنزيل نتيجة YouTube (محاولة %s): %s", attempt + 1, error)
+                logger.warning(
+                    "تعذر تنزيل نتيجة YouTube %s (محاولة %s): %s",
+                    entry.get("id") or entry_url,
+                    attempt,
+                    compact_youtube_error(error),
+                )
+                if is_youtube_auth_error(error):
+                    auth_errors += 1
+                    if auth_errors >= YOUTUBE_AUTH_ERROR_LIMIT:
+                        raise YouTubeAuthRequiredError(
+                            "يوتيوب طلب تحقق. حدّث cookies.txt من حساب يوتيوب شغال أو جرّب USE_YOUTUBE_COOKIES=0."
+                        ) from error
 
+    if last_error and is_youtube_auth_error(last_error):
+        raise YouTubeAuthRequiredError(
+            "يوتيوب طلب تحقق. حدّث cookies.txt من حساب يوتيوب شغال أو جرّب USE_YOUTUBE_COOKIES=0."
+        ) from last_error
     raise ValueError("لم يتم العثور على الأغنية") from last_error
 
 
