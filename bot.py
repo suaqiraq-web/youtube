@@ -296,17 +296,32 @@ def save_audio_file_id(query: str, file_id: str) -> None:
     )
 
 
-async def ensure_voice_clients_in_group(chat: Any, bot: Any) -> None:
-    """إدخال الحسابات المساعدة للمجموعة تلقائيا عبر رابط دعوة مؤقت."""
+async def ensure_voice_clients_in_group(chat: Any, bot: Any) -> list[Client]:
+    """العثور على الحسابات المساعدة داخل المجموعة وإدخال غير الموجود منها."""
     if not voice_clients:
         raise RuntimeError("لا توجد حسابات مساعدة متصلة")
 
     joined_clients: list[Client] = []
     missing_clients: list[Client] = []
     for client in voice_clients:
+        user = voice_client_users.get(client)
+        if user is None:
+            try:
+                user = await client.get_me()
+                voice_client_users[client] = user
+            except Exception as error:
+                logger.warning("Cannot read assistant account: %s", error)
+                missing_clients.append(client)
+                continue
+
         try:
-            await client.get_chat_member(chat.id, "me")
+            await client.get_chat_member(chat.id, user.id)
             joined_clients.append(client)
+            logger.info(
+                "Assistant %s is already a member of group %s",
+                f"@{user.username}" if user.username else user.id,
+                chat.id,
+            )
         except Exception:
             if chat.username:
                 try:
@@ -339,7 +354,12 @@ async def ensure_voice_clients_in_group(chat: Any, bot: Any) -> None:
                 try:
                     await client.join_chat(invite_link)
                     joined_clients.append(client)
-                    logger.info("Assistant joined group %s", chat.id)
+                    user = voice_client_users.get(client)
+                    logger.info(
+                        "Assistant %s joined group %s",
+                        f"@{user.username}" if user and user.username else user.id if user else "unknown",
+                        chat.id,
+                    )
                 except Exception as error:
                     logger.warning("Assistant could not join group %s: %s", chat.id, error)
 
@@ -365,6 +385,8 @@ async def ensure_voice_clients_in_group(chat: Any, bot: Any) -> None:
                 await client.add_chat_members(chat.id, user.id)
             except Exception:
                 pass
+
+    return joined_clients
 
 
 async def auto_join_voice_clients(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -758,21 +780,20 @@ async def play_song(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 pass
             voice_calls_by_group.pop(group_id, None)
 
-        await ensure_voice_clients_in_group(message.chat, context.bot)
+        group_clients = await ensure_voice_clients_in_group(message.chat, context.bot)
         assigned_client = voice_clients_by_group.get(group_id)
-        if assigned_client is not None and assigned_client.is_connected:
+        if assigned_client in group_clients and assigned_client.is_connected:
             clients = [assigned_client]
         else:
-            assigned_clients = set(voice_clients_by_group.values())
             clients = [
-                client for client in voice_clients
-                if client.is_connected and client not in assigned_clients
+                client for client in group_clients
+                if client.is_connected
             ]
-        if not clients and voice_client is not None and voice_client.is_connected:
-            if not voice_clients_by_group:
-                clients = [voice_client]
         if not clients:
-            raise RuntimeError("لا يوجد حساب مساعد متاح لهذه المجموعة")
+            raise RuntimeError(
+                "تم العثور على الحساب المساعد ضمن الأعضاء، لكنه غير متصل بجلسة Pyrogram. "
+                "تحقق من SESSION_STRINGS ثم أعد تشغيل البوت."
+            )
 
         last_error: Exception | None = None
         started = False
