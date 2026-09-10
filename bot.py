@@ -180,7 +180,7 @@ def search_song(query: str, download: bool = False) -> dict[str, Any]:
         "quiet": True,
         "no_warnings": True,
         "noplaylist": True,
-        "default_search": "ytsearch15",
+        "default_search": "ytsearch500",
         "extractor_retries": 4,
         "fragment_retries": 8,
         "retries": 4,
@@ -212,10 +212,10 @@ def search_song(query: str, download: bool = False) -> dict[str, Any]:
             logger.warning("YouTube search attempt %s failed: %s", attempt + 1, error)
 
     if not info:
-        raise ValueError("تعذر البحث في YouTube. حدّث cookies.txt أو جرّب رابطًا مباشرًا") from last_search_error
+        raise ValueError("لم يتم العثور على الأغنية") from last_search_error
     entries = [entry for entry in info.get("entries", [info]) if entry]
     if not entries:
-        raise ValueError("الأغنية غير موجودة")
+        raise ValueError("لم يتم العثور على الأغنية")
     if not download:
         return entries[0]
 
@@ -228,7 +228,7 @@ def search_song(query: str, download: bool = False) -> dict[str, Any]:
         }
     )
     last_error: Exception | None = None
-    for entry in entries[:10]:
+    for entry in entries[:500]:
         entry_url = entry.get("webpage_url") or entry.get("url")
         if not entry_url:
             continue
@@ -242,7 +242,7 @@ def search_song(query: str, download: bool = False) -> dict[str, Any]:
                 last_error = error
                 logger.warning("تعذر تنزيل نتيجة YouTube (محاولة %s): %s", attempt + 1, error)
 
-    raise ValueError("الأغنية غير موجودة ضمن أول 10 نتائج") from last_error
+    raise ValueError("لم يتم العثور على الأغنية") from last_error
 
 
 def downloaded_audio(song: dict[str, Any]) -> Path:
@@ -669,7 +669,15 @@ async def send_download_audio(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
     
     query = match.group(1).strip()
-    status = await message.reply_text("✨ الموسيقى قيد التجهيز، لا تستعجل 🎵 @znvsv")
+    requester = message.from_user
+    requester_name = (
+        f"@{requester.username}"
+        if requester and requester.username
+        else (requester.first_name if requester else "غير معروف")
+    )
+    status = await message.reply_text(
+        f"✨ الموسيقى قيد التجهيز، لا تستعجل 🎵\n👤 الطالب: {requester_name}"
+    )
 
     try:
         cached_file_id = AUDIO_FILE_IDS.get(normalized_query(query))
@@ -693,10 +701,7 @@ async def send_download_audio(update: Update, context: ContextTypes.DEFAULT_TYPE
             await status.delete()
         except Exception:
             pass
-        await message.reply_text(
-            "❌ ما كدرت أحمّل هاي الأغنية. جرّب اسمًا أوضح أو أرسل رابط YouTube مباشر.\n"
-            f"التفاصيل: {str(error)[:180]}"
-        )
+        await message.reply_text("❌ لم يتم العثور على الأغنية.")
 
 
 async def show_commands(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -757,7 +762,15 @@ async def play_song(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     query = match.group(1).strip()
-    status = await message.reply_text("✨ الموسيقى قيد التجهيز، لا تستعجل 🎵 @znvsv")
+    requester = message.from_user
+    requester_name = (
+        f"@{requester.username}"
+        if requester and requester.username
+        else (requester.first_name if requester else "غير معروف")
+    )
+    status = await message.reply_text(
+        f"✨ الموسيقى قيد التجهيز، لا تستعجل 🎵\n👤 الطالب: {requester_name}"
+    )
 
     try:
         info = await asyncio.to_thread(search_song, query, False)
@@ -783,12 +796,6 @@ async def play_song(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             audio_path = cached_path
 
         title = song.get("title", query)
-        requester = message.from_user
-        requester_name = (
-            f"@{requester.username}"
-            if requester and requester.username
-            else (requester.first_name if requester else "غير معروف")
-        )
         duration = format_song_duration(song.get("duration"))
 
         audio_path = await asyncio.to_thread(convert_to_voice_wav, Path(audio_path))
@@ -860,6 +867,12 @@ async def play_song(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             logger.warning("Voice started, but confirmation message could not be sent")
         return
 
+    except ValueError:
+        logger.exception("Voice song search failed")
+        try:
+            await status.edit_text("❌ لم يتم العثور على الأغنية.")
+        except Exception:
+            logger.warning("Could not send song search error message")
     except Exception as e:
         logger.exception("Voice playback failed")
         error_text = str(e)
