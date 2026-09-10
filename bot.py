@@ -227,15 +227,33 @@ def search_song(query: str, download: bool = False) -> dict[str, Any]:
 
 def downloaded_audio(song: dict[str, Any]) -> Path:
     """الحصول على مسار الملف الصوتي المحمّل، أو إرجاع ملف موجود من الكاش."""
+    reported_paths = [
+        song.get("filepath"),
+        song.get("_filename"),
+    ]
+    for download in song.get("requested_downloads") or []:
+        if isinstance(download, dict):
+            reported_paths.append(download.get("filepath"))
+            reported_paths.append(download.get("_filename"))
+
+    audio_suffixes = {".mp3", ".m4a", ".webm", ".opus", ".wav"}
+    for reported_path in reported_paths:
+        if reported_path:
+            path = Path(reported_path)
+            if path.is_file() and path.suffix.lower() in audio_suffixes:
+                return path
+
     song_id = song.get("id", "")
     matches = list(CACHE_DIR.glob(f"{song_id}.*"))
 
-    audio_files = [path for path in matches if path.suffix.lower() == ".mp3"]
-    if not audio_files:
-        audio_files = [path for path in matches if path.suffix.lower() in {".m4a", ".webm", ".opus", ".wav"}]
+    audio_files = [path for path in matches if path.suffix.lower() in audio_suffixes]
 
     if not audio_files:
-        all_files = list(CACHE_DIR.glob("*.mp3")) + list(CACHE_DIR.glob("*.m4a")) + list(CACHE_DIR.glob("*.wav"))
+        all_files = [
+            path
+            for path in CACHE_DIR.iterdir()
+            if path.is_file() and path.suffix.lower() in audio_suffixes
+        ]
         if all_files:
             return max(all_files, key=os.path.getctime)
         raise FileNotFoundError("تعذر تجهيز الملف الصوتي")
@@ -260,6 +278,7 @@ def format_song_duration(duration: Any) -> str:
     if hours:
         return f"{hours}:{minutes:02d}:{seconds:02d}"
     return f"{minutes}:{seconds:02d}"
+
 
 
 def control_user_label(user: Any) -> str:
