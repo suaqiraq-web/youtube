@@ -24,6 +24,7 @@ from telegram.ext import (
     ApplicationHandlerStop,
     CallbackQueryHandler,
     CommandHandler,
+    ChatMemberHandler,
     ContextTypes,
     MessageHandler,
     filters,
@@ -277,7 +278,7 @@ def save_audio_file_id(query: str, file_id: str) -> None:
 
 
 async def ensure_voice_clients_in_group(chat: Any, bot: Any) -> None:
-    """محاولة إدخال الحسابات المساعدة إلى المجموعة عند توفر صلاحية تيليجرام."""
+    """إدخال الحسابات المساعدة للمجموعة تلقائيا عبر رابط دعوة مؤقت."""
     if not voice_clients:
         raise RuntimeError("لا توجد حسابات مساعدة متصلة")
 
@@ -297,36 +298,44 @@ async def ensure_voice_clients_in_group(chat: Any, bot: Any) -> None:
             else:
                 missing_clients.append(client)
 
+    invite_link: str | None = None
     if missing_clients:
-        invite_link = None
         try:
-            invite_link = await bot.create_chat_invite_link(
+            invite = await bot.create_chat_invite_link(
                 chat_id=chat.id,
                 name="voice assistants",
                 member_limit=len(missing_clients),
             )
+            invite_link = invite.invite_link
+        except Exception as error:
+            logger.warning(
+                "Cannot create assistant invite link for %s. "
+                "The bot must be an administrator with invite permission: %s",
+                chat.id,
+                error,
+            )
+
+        if invite_link:
             for client in missing_clients:
                 try:
-                    await client.join_chat(invite_link.invite_link)
+                    await client.join_chat(invite_link)
                     joined_clients.append(client)
-                except Exception:
-                    pass
-        except Exception:
-            pass
-        finally:
-            if invite_link is not None:
-                try:
-                    await bot.revoke_chat_invite_link(
-                        chat_id=chat.id,
-                        invite_link=invite_link.invite_link,
-                    )
-                except Exception:
-                    pass
+                    logger.info("Assistant joined group %s", chat.id)
+                except Exception as error:
+                    logger.warning("Assistant could not join group %s: %s", chat.id, error)
+
+            try:
+                await bot.revoke_chat_invite_link(
+                    chat_id=chat.id,
+                    invite_link=invite_link,
+                )
+            except Exception:
+                logger.debug("Could not revoke temporary invite for %s", chat.id, exc_info=True)
 
     if not joined_clients:
         raise RuntimeError(
-            "الحسابات المساعدة غير موجودة في المجموعة. أضف حسابًا مساعدًا واحدًا أولًا "
-            "أو اجعل المجموعة عامة ليسهل انضمامها."
+            "تعذر إدخال الحساب المساعد تلقائيا. اجعل البوت مشرفا مع صلاحية "
+            "دعوة المستخدمين، ثم أعد المحاولة."
         )
 
     for client in joined_clients:
@@ -337,6 +346,21 @@ async def ensure_voice_clients_in_group(chat: Any, bot: Any) -> None:
                 await client.add_chat_members(chat.id, user.id)
             except Exception:
                 pass
+
+
+async def auto_join_voice_clients(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """إدخال الحسابات المساعدة فور إضافة البوت إلى مجموعة."""
+    membership = update.my_chat_member
+    if membership is None or membership.chat.type not in {ChatType.GROUP, ChatType.SUPERGROUP}:
+        return
+    if membership.new_chat_member.status not in {"member", "administrator", "creator"}:
+        return
+    if membership.old_chat_member.status in {"member", "administrator", "creator"}:
+        return
+    try:
+        await ensure_voice_clients_in_group(membership.chat, context.bot)
+    except Exception as error:
+        logger.warning("Automatic assistant join failed for group %s: %s", membership.chat.id, error)
 
 
 def convert_to_voice_wav(input_path: Path) -> Path:
@@ -998,6 +1022,10 @@ def build_application() -> Application:
         .post_init(post_init)
         .post_shutdown(post_shutdown)
         .build()
+    )
+
+    application.add_handler(
+        ChatMemberHandler(auto_join_voice_clients, ChatMemberHandler.MY_CHAT_MEMBER)
     )
     
     # أوامر التحكم بالمكالمة (للمشرفين فقط)
