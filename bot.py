@@ -176,6 +176,10 @@ MEMBERSHIP_CACHE_TTL = 60
 YOUTUBE_SEARCH_LIMIT = max(1, int(os.getenv("YOUTUBE_SEARCH_LIMIT", "8")))
 YOUTUBE_DOWNLOAD_CANDIDATE_LIMIT = max(1, int(os.getenv("YOUTUBE_DOWNLOAD_CANDIDATE_LIMIT", "4")))
 YOUTUBE_AUTH_ERROR_LIMIT = max(1, int(os.getenv("YOUTUBE_AUTH_ERROR_LIMIT", "2")))
+YOUTUBE_AUTH_MESSAGE = (
+    "يوتيوب طلب تحقق. حدّث cookies.txt من حساب يوتيوب شغال، "
+    "أو عطّل الكوكيز مؤقتاً عبر USE_YOUTUBE_COOKIES=0."
+)
 
 
 class YouTubeAuthRequiredError(RuntimeError):
@@ -241,16 +245,31 @@ def is_chat_active(chat_id: int) -> bool:
 
 def subscription_plan_duration(text: str, fallback: str = "month") -> tuple[str, timedelta]:
     normalized = normalize_moderation_text(text)
+    number_match = re.search(r"\d+", normalized)
+    amount = max(1, int(number_match.group(0))) if number_match else 1
+    if "ساعه" in normalized or "ساعة" in normalized or "ساعات" in normalized or "ساعتين" in normalized or "hour" in normalized:
+        return "hour", timedelta(hours=amount)
+    if "يوم" in normalized or "يومين" in normalized or "ايام" in normalized or "أيام" in normalized or "day" in normalized:
+        return "day", timedelta(days=amount)
     if "اسبوع" in normalized or "سبوع" in normalized or "week" in normalized:
-        return "week", timedelta(days=7)
+        return "week", timedelta(days=7 * amount)
     if "شهر" in normalized or "شهري" in normalized or "month" in normalized:
-        return "month", timedelta(days=30)
+        return "month", timedelta(days=30 * amount)
     return fallback, timedelta(days=7 if fallback == "week" else 30)
+
+
+def subscription_plan_label(plan: str) -> str:
+    return {
+        "hour": "بالساعات",
+        "day": "يومي",
+        "week": "أسبوعي",
+        "month": "شهري",
+    }.get(plan, "شهري")
 
 
 def has_subscription_plan(text: str) -> bool:
     normalized = normalize_moderation_text(text)
-    return any(word in normalized for word in {"اسبوع", "سبوع", "week", "شهر", "شهري", "month"})
+    return any(word in normalized for word in {"ساعه", "ساعة", "ساعات", "ساعتين", "hour", "يوم", "يومين", "ايام", "أيام", "day", "اسبوع", "سبوع", "week", "شهر", "شهري", "month"})
 
 
 def feature_enabled(chat_id: int, feature: str) -> bool:
@@ -304,6 +323,15 @@ def channel_join_url(channel: str) -> str:
     return channel
 
 
+def forced_channel_label(channel: str) -> str:
+    channel = channel.strip()
+    if channel.startswith("@"):
+        return channel
+    if re.fullmatch(r"[A-Za-z0-9_]{5,}", channel):
+        return f"@{channel}"
+    return "الكروب/القناة"
+
+
 def forced_channel(chat_id: int) -> str | None:
     value = chat_settings(chat_id).get("forced_channel")
     return value if isinstance(value, str) and value.strip() else None
@@ -332,14 +360,19 @@ async def has_forced_subscription(
     user_id: int,
     chat_id: int,
     context: ContextTypes.DEFAULT_TYPE,
+    *,
+    refresh: bool = False,
 ) -> bool:
     channel = forced_channel(chat_id)
     if not channel or not feature_enabled(chat_id, "force_sub"):
         return True
     cache_key = (chat_id, user_id, channel)
-    cached = read_bool_cache(SUBSCRIPTION_CACHE, cache_key)
-    if cached is not None:
-        return cached
+    if refresh:
+        SUBSCRIPTION_CACHE.pop(cache_key, None)
+    else:
+        cached = read_bool_cache(SUBSCRIPTION_CACHE, cache_key)
+        if cached is not None:
+            return cached
     try:
         member = await context.bot.get_chat_member(channel, user_id)
         return write_bool_cache(SUBSCRIPTION_CACHE, cache_key, member.status not in {"left", "kicked"})
@@ -452,6 +485,33 @@ def is_probable_url(value: str) -> bool:
     return bool(re.match(r"^https?://", value.strip(), flags=re.IGNORECASE))
 
 
+def is_youtube_video_entry(entry: dict[str, Any]) -> bool:
+    entry_id = str(entry.get("id") or "")
+    entry_type = str(entry.get("_type") or "").casefold()
+    ie_key = str(entry.get("ie_key") or "").casefold()
+    url = str(entry.get("url") or entry.get("webpage_url") or "").casefold()
+    if entry_type in {"playlist", "channel", "url_transparent"}:
+        return False
+    if "channel" in ie_key or "playlist" in ie_key:
+        return False
+    if "/channel/" in url or "/c/" in url or "/@" in url or "list=" in url:
+        return False
+    return bool(re.fullmatch(r"[\w-]{11}", entry_id))
+
+
+def youtube_entry_url(entry: dict[str, Any]) -> str | None:
+    webpage_url = entry.get("webpage_url")
+    if isinstance(webpage_url, str) and is_probable_url(webpage_url):
+        return webpage_url
+    entry_id = str(entry.get("id") or "")
+    if re.fullmatch(r"[\w-]{11}", entry_id):
+        return f"https://www.youtube.com/watch?v={entry_id}"
+    url = entry.get("url")
+    if isinstance(url, str) and is_probable_url(url):
+        return url
+    return None
+
+
 def youtube_player_clients(use_cookies: bool) -> list[str]:
     configured = os.getenv("YOUTUBE_PLAYER_CLIENTS", "").strip()
     if configured:
@@ -505,17 +565,19 @@ def search_song(query: str, download: bool = False) -> dict[str, Any]:
                 break
         except Exception as error:
             last_search_error = error
-            logger.warning("YouTube search attempt %s failed: %s", attempt + 1, error)
+            logger.warning("YouTube search attempt %s failed: %s", attempt, error)
             if is_youtube_auth_error(error):
                 continue
 
     if not info:
         if last_search_error and is_youtube_auth_error(last_search_error):
             raise YouTubeAuthRequiredError(
-                "يوتيوب طلب تحقق. حدّث cookies.txt من حساب يوتيوب شغال أو جرّب USE_YOUTUBE_COOKIES=0."
+                YOUTUBE_AUTH_MESSAGE
             ) from last_search_error
         raise ValueError("لم يتم العثور على الأغنية") from last_search_error
     entries = [entry for entry in info.get("entries", [info]) if entry]
+    if not is_probable_url(query):
+        entries = [entry for entry in entries if is_youtube_video_entry(entry)]
     if not entries:
         raise ValueError("لم يتم العثور على الأغنية")
     entries = entries[:YOUTUBE_SEARCH_LIMIT]
@@ -537,7 +599,7 @@ def search_song(query: str, download: bool = False) -> dict[str, Any]:
     last_error: Exception | None = None
     auth_errors = 0
     for entry in entries[:YOUTUBE_DOWNLOAD_CANDIDATE_LIMIT]:
-        entry_url = entry.get("webpage_url") or entry.get("url")
+        entry_url = youtube_entry_url(entry)
         if not entry_url:
             continue
         for attempt, download_options in enumerate(download_profiles, start=1):
@@ -556,12 +618,12 @@ def search_song(query: str, download: bool = False) -> dict[str, Any]:
                     auth_errors += 1
                     if auth_errors >= YOUTUBE_AUTH_ERROR_LIMIT:
                         raise YouTubeAuthRequiredError(
-                            "يوتيوب طلب تحقق. حدّث cookies.txt من حساب يوتيوب شغال أو جرّب USE_YOUTUBE_COOKIES=0."
+                            YOUTUBE_AUTH_MESSAGE
                         ) from error
 
     if last_error and is_youtube_auth_error(last_error):
         raise YouTubeAuthRequiredError(
-            "يوتيوب طلب تحقق. حدّث cookies.txt من حساب يوتيوب شغال أو جرّب USE_YOUTUBE_COOKIES=0."
+            YOUTUBE_AUTH_MESSAGE
         ) from last_error
     raise ValueError("لم يتم العثور على الأغنية") from last_error
 
@@ -913,7 +975,7 @@ async def owner_management(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         action = "تجديد" if renew else "تفعيل"
         await message.reply_text(
             f"✅ تم {action} البوت بنجاح.\n"
-            f"📦 النوع: {'أسبوعي' if plan == 'week' else 'شهري'}\n"
+            f"📦 النوع: {subscription_plan_label(plan)}\n"
             f"⏳ ينتهي: {format_datetime(expires_at)}"
         )
         raise ApplicationHandlerStop
@@ -955,6 +1017,7 @@ async def owner_management(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             raise ApplicationHandlerStop
         settings["forced_channel"] = channel
         settings["features"]["force_sub"] = True
+        SUBSCRIPTION_CACHE.clear()
         save_settings()
         await message.reply_text(f"✅ تم تفعيل الاشتراك الإجباري على {channel}")
         raise ApplicationHandlerStop
@@ -962,6 +1025,7 @@ async def owner_management(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     if "اشتراك اجباري" in normalized:
         settings.pop("forced_channel", None)
         settings["features"]["force_sub"] = False
+        SUBSCRIPTION_CACHE.clear()
         save_settings()
         await message.reply_text("✅ تم إلغاء الاشتراك الإجباري.")
         raise ApplicationHandlerStop
@@ -1004,10 +1068,14 @@ async def forced_subscription_guard(update: Update, context: ContextTypes.DEFAUL
         return
 
     channel = forced_channel(chat.id) or ""
+    label = forced_channel_label(channel)
     await message.reply_text(
-        "🔐 يجب الاشتراك بالقناة قبل استخدام البوت.",
+        f"🔐 يجب الاشتراك في {label} قبل استخدام البوت.",
         reply_markup=InlineKeyboardMarkup(
-            [[InlineKeyboardButton("اشترك بالقناة", url=channel_join_url(channel))]]
+            [
+                [InlineKeyboardButton(label, url=channel_join_url(channel))],
+                [InlineKeyboardButton("تحققت", callback_data="force_sub:check")],
+            ]
         ),
     )
     raise ApplicationHandlerStop
@@ -1027,9 +1095,27 @@ async def callback_preflight(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return
     if await is_privileged_in_chat(query.from_user.id, chat.id, context, user=query.from_user):
         return
-    if await has_forced_subscription(query.from_user.id, chat.id, context):
+    refresh = query.data == "force_sub:check"
+    if await has_forced_subscription(query.from_user.id, chat.id, context, refresh=refresh):
+        if refresh:
+            await query.answer("✅ تم التحقق، تقدر تستخدم البوت الآن.", show_alert=True)
         return
-    await query.answer("🔐 اشترك بالقناة أولاً.", show_alert=True)
+    channel = forced_channel(chat.id) or ""
+    label = forced_channel_label(channel)
+    if refresh and query.message:
+        try:
+            await query.edit_message_text(
+                f"🔐 يجب الاشتراك في {label} قبل استخدام البوت.",
+                reply_markup=InlineKeyboardMarkup(
+                    [
+                        [InlineKeyboardButton(label, url=channel_join_url(channel))],
+                        [InlineKeyboardButton("تحققت", callback_data="force_sub:check")],
+                    ]
+                ),
+            )
+        except Exception:
+            pass
+    await query.answer(f"🔐 اشترك في {label} أولاً.", show_alert=True)
     raise ApplicationHandlerStop
 
 
@@ -1241,6 +1327,13 @@ async def send_download_audio(update: Update, context: ContextTypes.DEFAULT_TYPE
         if sent_audio.audio:
             await asyncio.to_thread(save_audio_file_id, query, sent_audio.audio.file_id)
         await status.delete()
+    except YouTubeAuthRequiredError:
+        logger.exception("YouTube authentication required")
+        try:
+            await status.delete()
+        except Exception:
+            pass
+        await message.reply_text("❌ يوتيوب طلب تحقق حالياً. حدّث ملف cookies.txt أو جرّب لاحقاً.")
     except Exception as error:
         logger.exception("Song search failed")
         try:
@@ -1346,7 +1439,7 @@ async def play_song(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if cached_path is None:
             download_query = (
                 song_url
-                if (song_url := info.get("webpage_url") or info.get("url"))
+                if (song_url := youtube_entry_url(info))
                 else query
             )
             song = await asyncio.to_thread(search_song, download_query, True)
@@ -1427,6 +1520,12 @@ async def play_song(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             logger.warning("Voice started, but confirmation message could not be sent")
         return
 
+    except YouTubeAuthRequiredError:
+        logger.exception("Voice YouTube authentication required")
+        try:
+            await status.edit_text("❌ يوتيوب طلب تحقق حالياً. حدّث ملف cookies.txt أو جرّب لاحقاً.")
+        except Exception:
+            logger.warning("Could not send YouTube auth error message")
     except ValueError:
         logger.exception("Voice song search failed")
         try:
