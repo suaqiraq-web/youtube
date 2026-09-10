@@ -2,6 +2,7 @@ import asyncio
 import json
 import logging
 import os
+import random
 import re
 import subprocess
 import time
@@ -89,6 +90,7 @@ voice_client_users: dict[Client, Any] = {}
 voice_calls: Any | None = None
 voice_calls_by_group: dict[int, Any] = {}
 voice_clients_by_group: dict[int, Client] = {}
+game_states: dict[tuple[int, int], dict[str, Any]] = {}
 
 
 def normalize_moderation_text(text: str) -> str:
@@ -178,25 +180,39 @@ def search_song(query: str, download: bool = False) -> dict[str, Any]:
         "quiet": True,
         "no_warnings": True,
         "noplaylist": True,
-        "default_search": "ytsearch10",
-        "extractaudio": True,
-        "audioformat": "mp3",
-        "extractor_retries": 2,
-        "fragment_retries": 2,
-        "retries": 2,
+        "default_search": "ytsearch15",
+        "extractor_retries": 4,
+        "fragment_retries": 8,
+        "retries": 4,
+        "file_access_retries": 3,
+        "socket_timeout": 30,
+        "concurrent_fragment_downloads": 4,
         "sleep_interval_requests": 0,
         "force_ipv4": True,
+        "format_sort": ["abr", "acodec: opus", "acodec: mp4a", "asr"],
     }
-    if COOKIES_PATH.is_file() and os.getenv("USE_YOUTUBE_COOKIES", "1") != "0":
+    use_cookies = COOKIES_PATH.is_file() and os.getenv("USE_YOUTUBE_COOKIES", "1") != "0"
+    if use_cookies:
         options["cookiefile"] = str(COOKIES_PATH)
     search_options = options.copy()
     search_options["extract_flat"] = "in_playlist"
 
-    with yt_dlp.YoutubeDL(search_options) as downloader:
-        info = downloader.extract_info(query, download=False)
+    info = None
+    last_search_error: Exception | None = None
+    for attempt in range(2 if use_cookies else 1):
+        try:
+            if attempt == 1:
+                search_options.pop("cookiefile", None)
+            with yt_dlp.YoutubeDL(search_options) as downloader:
+                info = downloader.extract_info(query, download=False)
+            if info:
+                break
+        except Exception as error:
+            last_search_error = error
+            logger.warning("YouTube search attempt %s failed: %s", attempt + 1, error)
 
     if not info:
-        raise ValueError("الأغنية غير موجودة")
+        raise ValueError("تعذر البحث في YouTube. حدّث cookies.txt أو جرّب رابطًا مباشرًا") from last_search_error
     entries = [entry for entry in info.get("entries", [info]) if entry]
     if not entries:
         raise ValueError("الأغنية غير موجودة")
@@ -206,8 +222,9 @@ def search_song(query: str, download: bool = False) -> dict[str, Any]:
     download_options = options.copy()
     download_options.update(
         {
-            "format": "bestaudio/best",
+            "format": "bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio/best",
             "outtmpl": str(CACHE_DIR / "%(id)s.%(ext)s"),
+            "overwrites": False,
         }
     )
     last_error: Exception | None = None
@@ -215,12 +232,15 @@ def search_song(query: str, download: bool = False) -> dict[str, Any]:
         entry_url = entry.get("webpage_url") or entry.get("url")
         if not entry_url:
             continue
-        try:
-            with yt_dlp.YoutubeDL(download_options) as downloader:
-                return downloader.extract_info(entry_url, download=True)
-        except Exception as error:
-            last_error = error
-            logger.warning("تعذر تنزيل إحدى نتائج البحث: %s", error)
+        for attempt in range(2 if use_cookies else 1):
+            try:
+                if attempt == 1:
+                    download_options.pop("cookiefile", None)
+                with yt_dlp.YoutubeDL(download_options) as downloader:
+                    return downloader.extract_info(entry_url, download=True)
+            except Exception as error:
+                last_error = error
+                logger.warning("تعذر تنزيل نتيجة YouTube (محاولة %s): %s", attempt + 1, error)
 
     raise ValueError("الأغنية غير موجودة ضمن أول 10 نتائج") from last_error
 
@@ -700,6 +720,7 @@ async def show_commands(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             "/stop - إنهاء التشغيل\n"
             "/volume 50 - ضبط مستوى الصوت\n"
             "/clean - تنظيف ملفات الكاش\n\n"
+            "العاب أو /games - ألعاب جماعية وترفيهية\n\n"
             "كتم - كتم العضو بالرد على رسالته\n"
             "رفع كتم - رفع الكتم\n"
             "تحذير - إضافة تحذير\n"
@@ -710,6 +731,7 @@ async def show_commands(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         commands = (
             "📋 الأوامر المتاحة للأعضاء:\n\n"
             "يوت اسم الأغنية - تنزيل الأغنية كملف صوتي\n"
+            "العاب - قائمة 10 ألعاب\n"
             "الاوامر - عرض قائمة الأوامر"
         )
 
@@ -983,6 +1005,209 @@ async def handle_voice_button(update: Update, context: ContextTypes.DEFAULT_TYPE
         await query.edit_message_reply_markup(reply_markup=build_voice_panel(group_id))
 
 
+def games_menu() -> InlineKeyboardMarkup:
+    games = [
+        ("❌⭕ XO", "xo"),
+        ("🔴🟡 4 بصف", "connect4"),
+        ("✊ حجر ورق مقص", "rps"),
+        ("🎲 نرد", "dice"),
+        ("🪙 عملة", "coin"),
+        ("🔢 خمن الرقم", "guess"),
+        ("⬆️⬇️ أعلى أو أدنى", "higher"),
+        ("🎰 سلوت", "slots"),
+        ("❓ سؤال سريع", "quiz"),
+        ("🔤 فك الكلمة", "word"),
+    ]
+    return InlineKeyboardMarkup(
+        [[InlineKeyboardButton(label, callback_data=f"game:open:{name}") for label, name in games[index:index + 2]]
+         for index in range(0, len(games), 2)]
+    )
+
+
+async def games_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.effective_message
+    if message:
+        await message.reply_text("🎮 اختار لعبة:", reply_markup=games_menu())
+
+
+def game_back_button() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[InlineKeyboardButton("🎮 الألعاب", callback_data="game:menu")]])
+
+
+def xo_keyboard(board: list[str]) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton(board[index] or "·", callback_data=f"game:xo:{index}") for index in range(row, row + 3)]
+            for row in range(0, 9, 3)
+        ]
+    )
+
+
+def board_winner(board: list[str], size: int = 3, connect: int = 3) -> str | None:
+    lines = []
+    for row in range(size):
+        lines.append([row * size + column for column in range(size)])
+    for column in range(size):
+        lines.append([row * size + column for row in range(size)])
+    lines.append([index * (size + 1) for index in range(size)])
+    lines.append([(index + 1) * (size - 1) for index in range(size)])
+    for line in lines:
+        if len(line) >= connect and board[line[0]] and all(board[index] == board[line[0]] for index in line):
+            return board[line[0]]
+    return None
+
+
+def new_xo_state() -> dict[str, Any]:
+    return {"type": "xo", "board": [""] * 9, "turn": "X", "players": {}}
+
+
+def game_text(name: str) -> str:
+    return {
+        "rps": "✊ حجر ورق مقص: اختار حركتك",
+        "dice": "🎲 اضغط لرمي النرد",
+        "coin": "🪙 اضغط لقلب العملة",
+        "higher": "⬆️⬇️ الرقم الحالي: اضغط هل الرقم القادم أعلى أم أدنى؟",
+        "slots": "🎰 اضغط لتشغيل السلوت",
+        "quiz": "❓ سؤال سريع: ما عاصمة العراق؟",
+    }.get(name, "🎮 اختار لعبة")
+
+
+def game_buttons(name: str) -> InlineKeyboardMarkup:
+    buttons: dict[str, list[list[InlineKeyboardButton]]] = {
+        "rps": [[InlineKeyboardButton("✊", callback_data="game:rps:rock"), InlineKeyboardButton("✋", callback_data="game:rps:paper"), InlineKeyboardButton("✌️", callback_data="game:rps:scissors")]],
+        "dice": [[InlineKeyboardButton("🎲 ارْمِ", callback_data="game:dice:roll")]],
+        "coin": [[InlineKeyboardButton("🪙 اقلب", callback_data="game:coin:flip")]],
+        "higher": [[InlineKeyboardButton("⬆️ أعلى", callback_data="game:higher:up"), InlineKeyboardButton("⬇️ أدنى", callback_data="game:higher:down")]],
+        "slots": [[InlineKeyboardButton("🎰 تشغيل", callback_data="game:slots:spin")]],
+        "quiz": [[InlineKeyboardButton("بغداد", callback_data="game:quiz:baghdad"), InlineKeyboardButton("دمشق", callback_data="game:quiz:damascus"), InlineKeyboardButton("القاهرة", callback_data="game:quiz:cairo")]],
+    }
+    buttons[name].append([InlineKeyboardButton("🎮 الألعاب", callback_data="game:menu")])
+    return InlineKeyboardMarkup(buttons[name])
+
+
+async def handle_game_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    if query is None or not query.data:
+        return
+    parts = query.data.split(":")
+    if parts[0] != "game":
+        return
+    await query.answer()
+    if parts[1] == "menu":
+        await query.edit_message_text("🎮 اختار لعبة:", reply_markup=games_menu())
+        return
+    if parts[1] != "open":
+        return
+    name = parts[2]
+    key = (query.message.chat_id, query.message.message_id)
+    if name == "xo":
+        game_states[key] = new_xo_state()
+        await query.edit_message_text("❌⭕ XO\nالدور: X", reply_markup=xo_keyboard(game_states[key]["board"]))
+        return
+    if name == "connect4":
+        game_states[key] = {"type": "connect4", "board": [""] * 16, "turn": "🔴"}
+        keyboard = [[InlineKeyboardButton("·", callback_data=f"game:c4:{index}") for index in range(4)] for _ in range(4)]
+        await query.edit_message_text("🔴🟡 4 بصف\nالدور: 🔴", reply_markup=InlineKeyboardMarkup(keyboard))
+        return
+    if name == "guess":
+        game_states[key] = {"type": "guess", "number": random.randint(1, 10)}
+        await query.edit_message_text("🔢 خمن الرقم من 1 إلى 10", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(str(number), callback_data=f"game:guess:{number}") for number in range(1, 6)], [InlineKeyboardButton(str(number), callback_data=f"game:guess:{number}") for number in range(6, 11)], [InlineKeyboardButton("🎮 الألعاب", callback_data="game:menu")]]))
+        return
+    if name == "word":
+        word = random.choice(["موسيقى", "برمجة", "تليجرام", "اغنية", "كمبيوتر"])
+        game_states[key] = {"type": "word", "word": word}
+        shuffled = "".join(random.sample(word, len(word)))
+        await query.edit_message_text(f"🔤 رتب حروف الكلمة:\n`{shuffled}`", parse_mode="Markdown", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("إجابة", callback_data=f"game:word:{word}")], [InlineKeyboardButton("🎮 الألعاب", callback_data="game:menu")]]))
+        return
+    if name == "quiz":
+        await query.edit_message_text(game_text(name), reply_markup=game_buttons(name))
+        return
+    await query.edit_message_text(game_text(name), reply_markup=game_buttons(name))
+
+
+async def finish_game_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    if query is None or not query.data or not query.data.startswith("game:"):
+        return
+    parts = query.data.split(":")
+    if parts[1] in {"menu", "open"}:
+        await handle_game_button(update, context)
+        return
+    key = (query.message.chat_id, query.message.message_id)
+    state = game_states.get(key)
+    if parts[1] == "xo" and state:
+        index = int(parts[2])
+        if state["board"][index]:
+            return
+        player_id = query.from_user.id
+        players = state["players"]
+        if player_id not in players:
+            if len(players) >= 2:
+                await query.answer("اللعبة ممتلئة", show_alert=True)
+                return
+            players[player_id] = "X" if "X" not in players.values() else "O"
+        if players[player_id] != state["turn"]:
+            await query.answer("انتظر دورك", show_alert=True)
+            return
+        state["board"][index] = state["turn"]
+        winner = board_winner(state["board"])
+        if winner or all(state["board"]):
+            await query.edit_message_text(f"❌⭕ النتيجة: {winner or 'تعادل'}", reply_markup=game_back_button())
+            game_states.pop(key, None)
+        else:
+            state["turn"] = "O" if state["turn"] == "X" else "X"
+            await query.edit_message_reply_markup(reply_markup=xo_keyboard(state["board"]))
+        return
+    if parts[1] == "c4" and state:
+        index = int(parts[2])
+        column = index % 4
+        open_slots = [row * 4 + column for row in range(3, -1, -1) if not state["board"][row * 4 + column]]
+        if not open_slots:
+            await query.answer("هذا العمود ممتلئ", show_alert=True)
+            return
+        state["board"][open_slots[0]] = state["turn"]
+        winner = board_winner(state["board"], size=4, connect=4)
+        keyboard = [[InlineKeyboardButton(state["board"][row * 4 + col] or "·", callback_data=f"game:c4:{col}") for col in range(4)] for row in range(4)]
+        if winner or all(state["board"]):
+            await query.edit_message_text(f"🔴🟡 النتيجة: {winner or 'تعادل'}", reply_markup=game_back_button())
+            game_states.pop(key, None)
+        else:
+            state["turn"] = "🟡" if state["turn"] == "🔴" else "🔴"
+            await query.edit_message_text(f"🔴🟡 4 بصف\nالدور: {state['turn']}", reply_markup=InlineKeyboardMarkup(keyboard))
+        return
+    if parts[1] == "guess" and state:
+        guess = int(parts[2])
+        answer = state["number"]
+        text = "🎉 صحيح!" if guess == answer else f"❌ خطأ، الرقم كان {answer}"
+        await query.edit_message_text(text, reply_markup=game_back_button())
+        game_states.pop(key, None)
+        return
+    if parts[1] == "word" and state:
+        await query.edit_message_text("🎉 الكلمة هي: " + state["word"], reply_markup=game_back_button())
+        game_states.pop(key, None)
+        return
+    if parts[1] == "rps":
+        bot_move = random.choice(["rock", "paper", "scissors"])
+        labels = {"rock": "✊", "paper": "✋", "scissors": "✌️"}
+        await query.edit_message_text(f"أنت: {labels[parts[2]]}\nالبوت: {labels[bot_move]}", reply_markup=game_buttons("rps"))
+        return
+    if parts[1] == "dice":
+        await query.edit_message_text(f"🎲 النتيجة: {random.randint(1, 6)}", reply_markup=game_buttons("dice"))
+        return
+    if parts[1] == "coin":
+        await query.edit_message_text(f"🪙 {random.choice(['وجه', 'كتابة'])}", reply_markup=game_buttons("coin"))
+        return
+    if parts[1] == "higher":
+        await query.edit_message_text(f"🎯 الرقم الجديد: {random.randint(1, 100)}", reply_markup=game_buttons("higher"))
+        return
+    if parts[1] == "slots":
+        result = [random.choice(["🍒", "🍋", "⭐", "💎"]) for _ in range(3)]
+        await query.edit_message_text(" | ".join(result) + ("\n🎉 فزت!" if len(set(result)) == 1 else ""), reply_markup=game_buttons("slots"))
+        return
+    if parts[1] == "quiz":
+        await query.edit_message_text("✅ صحيح، عاصمة العراق بغداد!", reply_markup=game_buttons("quiz"))
+
+
 async def clean_cache_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """تنظيف ملفات الكاش (للمشرفين فقط)"""
     if not await is_admin(update, context):
@@ -1067,6 +1292,8 @@ def build_application() -> Application:
     application.add_handler(
         ChatMemberHandler(auto_join_voice_clients, ChatMemberHandler.MY_CHAT_MEMBER)
     )
+    application.add_handler(CallbackQueryHandler(handle_voice_button, pattern=r"^voice_(pause|resume|skip):"))
+    application.add_handler(CallbackQueryHandler(finish_game_callback, pattern=r"^game:"))
     
     # أوامر التحكم بالمكالمة (للمشرفين فقط)
     application.add_handler(CommandHandler(
@@ -1079,6 +1306,11 @@ def build_application() -> Application:
     application.add_handler(CommandHandler("warn", warn_member))
     application.add_handler(CommandHandler("unwarn", unwarn_member))
     application.add_handler(CommandHandler("clearwarnings", clear_warnings))
+    application.add_handler(CommandHandler("games", games_command))
+    application.add_handler(MessageHandler(
+        filters.Regex(r"^(العاب|ألعاب)$") & filters.TEXT,
+        games_command,
+    ))
 
     application.add_handler(MessageHandler(
         filters.Regex(r"^كتم(?:\s+.+)?$") & filters.TEXT & filters.ChatType.GROUPS,
