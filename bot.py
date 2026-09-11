@@ -1234,6 +1234,54 @@ async def delete_my_messages(update: Update, context: ContextTypes.DEFAULT_TYPE)
     await message.reply_text(f"🧹 تم حذف {deleted} رسالة لك داخل هذه المجموعة.")
 
 
+async def delete_replied_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """حذف الرسالة التي تم الرد عليها باستخدام أمر «مسح»."""
+    message = update.effective_message
+    if not message or not message.text or not message.chat:
+        return
+
+    if message.text.strip() != "مسح":
+        return
+
+    # أمر المسح للمشرفين/مالك البوت فقط.
+    if not await is_admin(update, context):
+        return
+
+    replied = message.reply_to_message
+    if replied is None:
+        await message.reply_text("⚠️ لازم تسوي رد (Reply) على الرسالة اللي تريد أمسحها.")
+        return
+
+    try:
+        bot_member = await context.bot.get_chat_member(
+            message.chat.id,
+            context.bot.id,
+        )
+        if bot_member.status not in {"administrator", "creator"}:
+            await message.reply_text("❌ لازم البوت يكون مشرف حتى أگدر أمسح الرسائل.")
+            return
+
+        if bot_member.status == "administrator" and not getattr(bot_member, "can_delete_messages", False):
+            await message.reply_text("❌ البوت مشرف، لكن ما عنده صلاحية حذف الرسائل.")
+            return
+
+        await context.bot.delete_message(
+            chat_id=message.chat.id,
+            message_id=replied.message_id,
+        )
+
+        # حذف أمر «مسح» نفسه بعد نجاح الحذف.
+        try:
+            await message.delete()
+        except Exception:
+            pass
+    except Exception:
+        logger.exception("Could not delete replied message in chat %s", message.chat.id)
+        await message.reply_text(
+            "❌ ما گدرت أمسح الرسالة. تأكد أن البوت مشرف وعنده صلاحية حذف الرسائل."
+        )
+
+
 async def owner_management(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     message = update.effective_message
     user = update.effective_user
@@ -2393,6 +2441,11 @@ def build_application() -> Application:
     application.add_handler(MessageHandler(
         filters.Regex(r"^مسح رسائلي$") & filters.TEXT & filters.ChatType.GROUPS,
         delete_my_messages,
+    ))
+
+    application.add_handler(MessageHandler(
+        filters.Regex(r"^مسح$") & filters.TEXT & filters.ChatType.GROUPS,
+        delete_replied_message,
     ))
 
     # عرض الأوامر حسب صلاحية المستخدم
