@@ -119,7 +119,7 @@ FEATURE_ALIASES = {
 BOT_COMMAND_PATTERNS = [
     r"^يوت\s+.+$",
     r"^شغل\s+.+$",
-    r"^(العاب|ألعاب|الاوامر|كتم|رفع كتم|تحذير|رفع تحذير|مسح تحذيرات|مسح)(?:\s+.*)?$",
+    r"^(العاب|ألعاب|الاوامر|كتم|رفع كتم|تحذير|رفع تحذير|مسح تحذيرات)(?:\s+.*)?$",
     r"^(تخطي|غني|توقف|إيقاف|ايقاف|اوكف)$",
     r"^/(pause|resume|skip|stop|volume|clean|mute|unmute|warn|unwarn|clearwarnings|games)(?:@\w+)?(?:\s+.*)?$",
 ]
@@ -432,32 +432,9 @@ def feature_from_text(text: str) -> str | None:
     return None
 
 
-def split_bot_commands(text: str) -> list[str]:
-    """تقسيم رسالة تحتوي على أكثر من أمر إلى أوامر مستقلة.
-
-    الفاصل الأساسي هو سطر جديد، مع دعم الفاصلة المنقوطة العربية/العادية.
-    لا نقسم المسافات العادية حتى تبقى أسماء الأغاني والوسائط كما هي.
-    """
-    if not text:
-        return []
-    parts = re.split(r"[\n\r]+|[؛;]+", text)
-    return [part.strip() for part in parts if part.strip()]
-
-
-def is_single_bot_command_text(text: str) -> bool:
+def is_bot_command_text(text: str) -> bool:
     stripped = text.strip()
     return any(re.match(pattern, stripped, flags=re.IGNORECASE) for pattern in BOT_COMMAND_PATTERNS)
-
-
-def is_bot_command_text(text: str) -> bool:
-    """التحقق من وجود أمر واحد أو أكثر داخل الرسالة."""
-    commands = split_bot_commands(text)
-    return bool(commands) and any(is_single_bot_command_text(command) for command in commands)
-
-
-def is_owner_command_text(text: str) -> bool:
-    """التحقق من وجود أمر إدارة للمالك حتى لو كانت الرسالة متعددة الأوامر."""
-    return any(OWNER_COMMAND_RE.match(command) for command in split_bot_commands(text))
 
 
 def is_bot_owner_user(user: Any) -> bool:
@@ -1225,76 +1202,6 @@ async def user_info_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     await message.reply_text(response)
 
 
-async def delete_replied_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """حذف الرسالة التي تم الرد عليها بأمر «مسح».
-
-    الأمر للمشرفين فقط، ويستطيع البوت حذف رسالة عضو أو مشرف إذا كانت
-    صلاحية حذف الرسائل ممنوحة له من Telegram. لا يتم استخدام
-    get_protection_target هنا لأنه يمنع استهداف المشرفين.
-    """
-    message = update.effective_message
-    chat = update.effective_chat
-    if not message or not chat or not message.text:
-        return
-
-    if message.text.strip() != "مسح":
-        return
-
-    if chat.type not in {ChatType.GROUP, ChatType.SUPERGROUP}:
-        return
-
-    if not await is_admin(update, context):
-        await message.reply_text("❌ أمر مسح الرسائل متاح للمشرفين فقط.")
-        return
-
-    if message.reply_to_message is None:
-        await message.reply_text("⚠️ لازم تسوي رد (Reply) على الرسالة اللي تريد أمسحها.")
-        return
-
-    try:
-        bot_member = await context.bot.get_chat_member(chat.id, context.bot.id)
-        if bot_member.status not in {"administrator", "creator"}:
-            await message.reply_text("❌ لازم يكون البوت مشرف حتى يگدر يمسح الرسائل.")
-            return
-
-        if not getattr(bot_member, "can_delete_messages", False):
-            await message.reply_text("❌ البوت مشرف، لكن ما عنده صلاحية حذف الرسائل.")
-            return
-
-        target_message_id = message.reply_to_message.message_id
-        await context.bot.delete_message(
-            chat_id=chat.id,
-            message_id=target_message_id,
-        )
-
-        # حذف أمر «مسح» نفسه بعد نجاح العملية.
-        try:
-            await context.bot.delete_message(
-                chat_id=chat.id,
-                message_id=message.message_id,
-            )
-        except Exception:
-            pass
-
-        logger.info(
-            "Deleted replied message %s in chat %s by user %s",
-            target_message_id,
-            chat.id,
-            message.from_user.id if message.from_user else "unknown",
-        )
-    except Exception as error:
-        logger.warning(
-            "Could not delete replied message %s in chat %s: %s",
-            getattr(message.reply_to_message, "message_id", "unknown"),
-            chat.id,
-            error,
-        )
-        await message.reply_text(
-            "❌ ما گدرت أمسح الرسالة. تأكد أن البوت مشرف وعنده صلاحية حذف الرسائل، "
-            "وأن الرسالة قابلة للحذف حسب قيود Telegram."
-        )
-
-
 async def delete_my_messages(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """مسح رسائل المستخدم الحالي داخل المجموعة."""
     message = update.effective_message
@@ -1325,6 +1232,54 @@ async def delete_my_messages(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 pass
 
     await message.reply_text(f"🧹 تم حذف {deleted} رسالة لك داخل هذه المجموعة.")
+
+
+async def delete_replied_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """حذف الرسالة التي تم الرد عليها باستخدام أمر «مسح»."""
+    message = update.effective_message
+    if not message or not message.text or not message.chat:
+        return
+
+    if message.text.strip() != "مسح":
+        return
+
+    # أمر المسح للمشرفين/مالك البوت فقط.
+    if not await is_admin(update, context):
+        return
+
+    replied = message.reply_to_message
+    if replied is None:
+        await message.reply_text("⚠️ لازم تسوي رد (Reply) على الرسالة اللي تريد أمسحها.")
+        return
+
+    try:
+        bot_member = await context.bot.get_chat_member(
+            message.chat.id,
+            context.bot.id,
+        )
+        if bot_member.status not in {"administrator", "creator"}:
+            await message.reply_text("❌ لازم البوت يكون مشرف حتى أگدر أمسح الرسائل.")
+            return
+
+        if bot_member.status == "administrator" and not getattr(bot_member, "can_delete_messages", False):
+            await message.reply_text("❌ البوت مشرف، لكن ما عنده صلاحية حذف الرسائل.")
+            return
+
+        await context.bot.delete_message(
+            chat_id=message.chat.id,
+            message_id=replied.message_id,
+        )
+
+        # حذف أمر «مسح» نفسه بعد نجاح الحذف.
+        try:
+            await message.delete()
+        except Exception:
+            pass
+    except Exception:
+        logger.exception("Could not delete replied message in chat %s", message.chat.id)
+        await message.reply_text(
+            "❌ ما گدرت أمسح الرسالة. تأكد أن البوت مشرف وعنده صلاحية حذف الرسائل."
+        )
 
 
 async def owner_management(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1476,7 +1431,7 @@ async def activation_guard(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     if is_chat_active(chat.id):
         return
     text = message.text or ""
-    if is_owner_command_text(text) and is_bot_owner_user(update.effective_user):
+    if OWNER_COMMAND_RE.match(text.strip()) and is_bot_owner_user(update.effective_user):
         return
     if text and is_bot_command_text(text):
         await message.reply_text(ACTIVATION_REQUIRED_TEXT)
@@ -1831,7 +1786,6 @@ async def show_commands(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
                 "تحذير - إضافة تحذير",
                 "رفع تحذير - حذف تحذير واحد",
                 "مسح تحذيرات - حذف كل التحذيرات",
-                "مسح - بالرد على أي رسالة لحذفها (حتى رسالة المشرف إذا كانت صلاحية الحذف متوفرة)",
                 "الأعضاء: 5 ردود بكلمة تحذير تعطي العضو تحذيرًا رسميًا",
             ])
         commands = "\n".join(command_lines)
@@ -2414,90 +2368,6 @@ async def post_shutdown(_: Application) -> None:
     logger.info("✅ Bot shut down cleanly")
 
 
-async def dispatch_multiple_commands(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """تنفيذ عدة أوامر موجودة في رسالة واحدة بالتوازي.
-
-    مثال:
-        يوت song one
-        يوت song two
-        العاب
-
-    أو باستخدام «؛» كفاصل. لا نستخدم المسافات كفاصل حتى لا تنكسر أسماء
-    الأغاني والعبارات التي تحتوي على أكثر من كلمة.
-    """
-    message = update.effective_message
-    if not message or not message.text:
-        return
-
-    commands = split_bot_commands(message.text)
-    if len(commands) < 2:
-        return
-
-    # نطابق فقط الأوامر التي يمكن تشغيلها من MessageHandler مباشرة.
-    # أوامر المالك الحساسة تبقى في owner_management ولا تُنفذ من هذا المسار.
-    tasks: list[asyncio.Task[Any]] = []
-
-    def add(handler: Any) -> None:
-        tasks.append(asyncio.create_task(handler(update, context)))
-
-    recognized = 0
-    for command in commands:
-        normalized = command.casefold().strip()
-
-        if re.match(r"^يوت\s+.+$", command, flags=re.IGNORECASE):
-            add(send_download_audio)
-            recognized += 1
-        elif re.match(r"^شغل\s+.+$", command, flags=re.IGNORECASE):
-            add(play_song)
-            recognized += 1
-        elif re.match(r"^(العاب|ألعاب)$", command, flags=re.IGNORECASE):
-            add(games_command)
-            recognized += 1
-        elif re.match(r"^كتم(?:\s+.+)?$", command, flags=re.IGNORECASE):
-            add(mute_member)
-            recognized += 1
-        elif re.match(r"^رفع كتم(?:\s+.+)?$", command, flags=re.IGNORECASE):
-            add(unmute_member)
-            recognized += 1
-        elif re.match(r"^تحذير(?:\s+.+)?$", command, flags=re.IGNORECASE):
-            add(warn_member)
-            recognized += 1
-        elif re.match(r"^رفع تحذير(?:\s+.+)?$", command, flags=re.IGNORECASE):
-            add(unwarn_member)
-            recognized += 1
-        elif re.match(r"^مسح تحذيرات(?:\s+.+)?$", command, flags=re.IGNORECASE):
-            add(clear_warnings)
-            recognized += 1
-        elif normalized in {"مسح", "مسح رسائلي"}:
-            add(delete_replied_message if normalized == "مسح" else delete_my_messages)
-            recognized += 1
-        elif normalized in {"الاوامر"}:
-            add(show_commands)
-            recognized += 1
-        elif normalized in {"تخطي", "غني", "توقف", "إيقاف", "ايقاف", "اوكف"}:
-            add(control_call)
-            recognized += 1
-
-    if recognized < 2:
-        # ليست رسالة أوامر متعددة فعلياً؛ نترك الـhandlers العادية تتعامل معها.
-        for task in tasks:
-            if not task.done():
-                task.cancel()
-        return
-
-    results = await asyncio.gather(*tasks, return_exceptions=True)
-    for result in results:
-        if isinstance(result, Exception):
-            logger.error(
-                "Multi-command execution failed: %s",
-                result,
-                exc_info=(type(result), result, result.__traceback__),
-            )
-
-    # منع الـhandlers العادية من إعادة تنفيذ نفس الأوامر.
-    raise ApplicationHandlerStop
-
-
 def build_application() -> Application:
     """بناء التطبيق الرئيسي"""
     if not BOT_TOKEN:
@@ -2508,7 +2378,6 @@ def build_application() -> Application:
         .token(BOT_TOKEN)
         .post_init(post_init)
         .post_shutdown(post_shutdown)
-        .concurrent_updates(True)
         .build()
     )
 
@@ -2573,16 +2442,11 @@ def build_application() -> Application:
         filters.Regex(r"^مسح رسائلي$") & filters.TEXT & filters.ChatType.GROUPS,
         delete_my_messages,
     ))
+
     application.add_handler(MessageHandler(
         filters.Regex(r"^مسح$") & filters.TEXT & filters.ChatType.GROUPS,
         delete_replied_message,
     ))
-
-    # تنفيذ عدة أوامر في رسالة واحدة بالتوازي قبل الـhandlers العادية.
-    application.add_handler(
-        MessageHandler(filters.TEXT & filters.ChatType.GROUPS, dispatch_multiple_commands),
-        group=0,
-    )
 
     # عرض الأوامر حسب صلاحية المستخدم
     application.add_handler(MessageHandler(
