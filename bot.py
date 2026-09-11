@@ -352,7 +352,7 @@ async def post_shutdown(_: Application) -> None:
     logger.info("✅ Bot shut down cleanly")
 
 
-def build_application() -> Application:
+def chat_settings(chat_id: int) -> dict[str, Any]:
     key = str(chat_id)
     if key not in SETTINGS or not isinstance(SETTINGS[key], dict):
         SETTINGS[key] = {}
