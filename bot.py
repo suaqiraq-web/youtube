@@ -1234,39 +1234,6 @@ async def delete_my_messages(update: Update, context: ContextTypes.DEFAULT_TYPE)
     await message.reply_text(f"🧹 تم حذف {deleted} رسالة لك داخل هذه المجموعة.")
 
 
-async def clear_all_messages(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """مسح جميع الرسائل الأخيرة في المجموعة، بما فيها رسائل البوت نفسه (للمشرفين فقط)."""
-    message = update.effective_message
-    chat = update.effective_chat
-    if not message or not chat:
-        return
-
-    if not await is_admin(update, context):
-        await message.reply_text("❌ هذا الأمر متاح فقط للمشرفين.")
-        return
-
-    try:
-        history = await context.bot.get_chat_history(chat_id=chat.id, limit=200)
-    except Exception:
-        await message.reply_text("❌ تعذر الوصول إلى رسائل المجموعة.")
-        return
-
-    deleted = 0
-    for msg in history:
-        try:
-            await msg.delete()
-            deleted += 1
-        except Exception:
-            pass
-
-    status = await context.bot.send_message(chat_id=chat.id, text=f"🧹 تم حذف {deleted} رسالة من المجموعة.")
-    await asyncio.sleep(3)
-    try:
-        await status.delete()
-    except Exception:
-        pass
-
-
 async def owner_management(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     message = update.effective_message
     user = update.effective_user
@@ -2361,7 +2328,6 @@ def build_application() -> Application:
     application = (
         Application.builder()
         .token(BOT_TOKEN)
-        .concurrent_updates(10)
         .post_init(post_init)
         .post_shutdown(post_shutdown)
         .build()
@@ -2427,10 +2393,6 @@ def build_application() -> Application:
     application.add_handler(MessageHandler(
         filters.Regex(r"^مسح رسائلي$") & filters.TEXT & filters.ChatType.GROUPS,
         delete_my_messages,
-    ))
-    application.add_handler(MessageHandler(
-        filters.Regex(r"^مسح$") & filters.TEXT & filters.ChatType.GROUPS,
-        clear_all_messages,
     ))
 
     # عرض الأوامر حسب صلاحية المستخدم
