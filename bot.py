@@ -61,6 +61,8 @@ if SESSION_STRING_2:
     )
 configured_session_strings = list(dict.fromkeys(configured_session_strings))
 CACHE_DIR = Path(os.getenv("CACHE_DIR", "cache"))
+if not CACHE_DIR.is_absolute():
+    CACHE_DIR = BASE_DIR / CACHE_DIR
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
 COOKIES_PATH = BASE_DIR / "cookies.txt"
 AUDIO_FILE_IDS_PATH = CACHE_DIR / "audio_file_ids.json"
@@ -78,6 +80,7 @@ BOT_OWNER_USERNAMES = {
     for value in re.split(r"[,\s]+", os.getenv("BOT_OWNER_USERNAMES", "znvsv,fadl22b"))
     if value.strip()
 }
+CLEANUP_INTERVAL_MINUTES = max(1, int(os.getenv("CLEANUP_INTERVAL_MINUTES", "15")))
 
 DEFAULT_FEATURES = {
     "download": True,
@@ -121,7 +124,7 @@ BOT_COMMAND_PATTERNS = [
     r"^/(pause|resume|skip|stop|volume|clean|mute|unmute|warn|unwarn|clearwarnings|games)(?:@\w+)?(?:\s+.*)?$",
 ]
 OWNER_COMMAND_RE = re.compile(
-    r"^(تفعيل|الغاء تفعيل|إلغاء تفعيل|ت م|الميزات|حالة الاشتراك|اشتراك اجباري|اشتراك إجباري|حذف اشتراك اجباري|الغاء اشتراك اجباري|إلغاء اشتراك إجباري)(?:\s+.*)?$",
+    r"^(تفعيل|الغاء تفعيل|إلغاء تفعيل|ت م|الميزات|حالة الاشتراك|تاريخ|تاريخ الاشتراك|اشتراك اجباري|اشتراك إجباري|حذف اشتراك اجباري|الغاء اشتراك اجباري|إلغاء اشتراك إجباري|ايدي|آيدي|مسح رسائلي)(?:\s+.*)?$",
     flags=re.IGNORECASE,
 )
 ACTIVATION_REQUIRED_TEXT = (
@@ -173,8 +176,8 @@ game_states: dict[tuple[int, int], dict[str, Any]] = {}
 PRIVILEGE_CACHE: dict[tuple[int, int], tuple[float, bool]] = {}
 SUBSCRIPTION_CACHE: dict[tuple[int, int, str], tuple[float, bool]] = {}
 MEMBERSHIP_CACHE_TTL = 60
-YOUTUBE_SEARCH_LIMIT = max(1, int(os.getenv("YOUTUBE_SEARCH_LIMIT", "8")))
-YOUTUBE_DOWNLOAD_CANDIDATE_LIMIT = max(1, int(os.getenv("YOUTUBE_DOWNLOAD_CANDIDATE_LIMIT", "4")))
+YOUTUBE_SEARCH_LIMIT = max(1, int(os.getenv("YOUTUBE_SEARCH_LIMIT", "50")))
+YOUTUBE_DOWNLOAD_CANDIDATE_LIMIT = max(1, int(os.getenv("YOUTUBE_DOWNLOAD_CANDIDATE_LIMIT", "10")))
 YOUTUBE_AUTH_ERROR_LIMIT = max(1, int(os.getenv("YOUTUBE_AUTH_ERROR_LIMIT", "100")))
 YOUTUBE_AUTH_MESSAGE = (
     "يوتيوب طلب تحقق. حدّث cookies.txt من حساب يوتيوب شغال، "
@@ -204,7 +207,152 @@ def save_warn_votes() -> None:
     )
 
 
-def chat_settings(chat_id: int) -> dict[str, Any]:
+def cleanup_cache_and_logs() -> tuple[int, int, int]:
+    """تنظيف الملفات المؤقتة والملفات القديمة قبل أن تملأ السيرفر."""
+    now = time.time()
+    removed_files = 0
+    removed_dirs = 0
+    bytes_removed = 0
+    protected_names = {"audio_file_ids.json", "warnings.json", "warn_votes.json", "settings.json"}
+
+    for path in sorted(CACHE_DIR.rglob("*"), key=lambda item: str(item).lower()):
+        try:
+            if path.is_dir():
+                if path.name in {"__pycache__"}:
+                    for child in sorted(path.rglob("*"), reverse=True):
+                        if child.is_file():
+                            try:
+                                child.unlink()
+                                removed_files += 1
+                                bytes_removed += child.stat().st_size if child.exists() else 0
+                            except Exception:
+                                pass
+                    try:
+                        path.rmdir()
+                        removed_dirs += 1
+                    except Exception:
+                        pass
+                continue
+
+            if path.name in protected_names:
+                continue
+
+            if path.suffix.lower() in {".log", ".tmp", ".bak"}:
+                path.unlink()
+                removed_files += 1
+                continue
+
+            if path.suffix.lower() in {".mp3", ".m4a", ".webm", ".opus", ".wav", ".ogg"}:
+                if (now - path.stat().st_mtime) > 2 * 86400:
+                    bytes_removed += path.stat().st_size
+                    path.unlink()
+                    removed_files += 1
+                    continue
+
+            if path.name.startswith("yt_dlp") or path.name.endswith(".part"):
+                bytes_removed += path.stat().st_size
+                path.unlink()
+                removed_files += 1
+        except Exception:
+            continue
+
+    for directory in [CACHE_DIR / "yt_dlp_cache", CACHE_DIR / "temp"]:
+        if directory.exists() and directory.is_dir():
+            try:
+                for child in list(directory.rglob("*")):
+                    if child.is_file() and (now - child.stat().st_mtime) > 2 * 86400:
+                        bytes_removed += child.stat().st_size
+                        child.unlink()
+                        removed_files += 1
+                for child in sorted(directory.rglob("*"), reverse=True):
+                    if child.is_dir():
+                        try:
+                            child.rmdir()
+                            removed_dirs += 1
+                        except Exception:
+                            pass
+                if not any(directory.iterdir()):
+                    try:
+                        directory.rmdir()
+                        removed_dirs += 1
+                    except Exception:
+                        pass
+            except Exception:
+                continue
+
+    return removed_files, removed_dirs, bytes_removed
+
+
+async def periodic_cache_cleanup() -> None:
+    while True:
+        try:
+            removed_files, removed_dirs, bytes_removed = cleanup_cache_and_logs()
+            if removed_files or removed_dirs or bytes_removed:
+                logger.info(
+                    "Cleaned cache: files=%s directories=%s bytes=%s",
+                    removed_files,
+                    removed_dirs,
+                    bytes_removed,
+                )
+        except Exception:
+            logger.exception("Cache cleanup failed")
+        await asyncio.sleep(CLEANUP_INTERVAL_MINUTES * 60)
+
+
+async def post_init(_: Application) -> None:
+    """تهيئة البوت عند التشغيل"""
+    global voice_client, voice_clients, voice_client_users
+    if not (API_ID and API_HASH and configured_session_strings):
+        logger.warning("⚠️ Voice calls disabled: missing API_ID, API_HASH, or session strings")
+        return
+
+    for index, session_string in enumerate(configured_session_strings, start=1):
+        client = Client(
+            f"voice_session_{index}",
+            api_id=API_ID,
+            api_hash=API_HASH,
+            session_string=session_string,
+        )
+        try:
+            await client.start()
+            voice_clients.append(client)
+            me = await client.get_me()
+            voice_client_users[client] = me
+            if voice_client is None:
+                voice_client = client
+            logger.info(f"✅ Voice client {index} started as: {me.first_name} (@{me.username})")
+        except Exception:
+            logger.exception(f"❌ Failed to start voice client {index}")
+            try:
+                await client.stop()
+            except Exception:
+                pass
+
+    asyncio.create_task(periodic_cache_cleanup())
+    asyncio.create_task(daily_group_report_loop(_))
+
+
+async def post_shutdown(_: Application) -> None:
+    """إيقاف البوت بشكل نظيف"""
+    global voice_calls_by_group, voice_clients
+
+    for group_call in voice_calls_by_group.values():
+        try:
+            await group_call.stop()
+        except Exception:
+            pass
+    voice_calls_by_group.clear()
+
+    for client in voice_clients:
+        try:
+            await client.stop()
+        except Exception:
+            pass
+
+    logger.info("✅ Bot shut down cleanly")
+
+
+def build_application() -> Application:
     key = str(chat_id)
     if key not in SETTINGS or not isinstance(SETTINGS[key], dict):
         SETTINGS[key] = {}
@@ -572,18 +720,22 @@ def youtube_options(use_cookies: bool) -> dict[str, Any]:
         "no_warnings": True,
         "noplaylist": True,
         "default_search": f"ytsearch{YOUTUBE_SEARCH_LIMIT}",
-        "extractor_retries": 2,
-        "fragment_retries": 3,
-        "retries": 2,
-        "file_access_retries": 2,
-        "socket_timeout": 15,
-        "concurrent_fragment_downloads": 8,
+        "extractor_retries": 6,
+        "fragment_retries": 10,
+        "retries": 6,
+        "file_access_retries": 6,
+        "socket_timeout": 30,
+        "concurrent_fragment_downloads": 12,
         "sleep_interval_requests": 0,
         "force_ipv4": True,
         "cachedir": str(CACHE_DIR / "yt_dlp_cache"),
         "skip_unavailable_fragments": True,
         "extractor_args": {"youtube": {"player_client": youtube_player_clients(use_cookies)}},
-        "format_sort": ["acodec:mp4a", "ext:m4a", "abr:128"],
+        "format_sort": ["acodec:mp4a", "ext:m4a", "abr:128", "vcodec:h264"],
+        "http_headers": {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+            "Accept-Language": "en-US,en;q=0.9",
+        },
     }
     if use_cookies:
         options["cookiefile"] = str(COOKIES_PATH)
@@ -591,7 +743,7 @@ def youtube_options(use_cookies: bool) -> dict[str, Any]:
 
 
 def search_song(query: str, download: bool = False) -> dict[str, Any]:
-    """البحث عن أغنية وتحميلها من يوتيوب"""
+    """البحث عن أغنية وتحميلها من يوتيوب."""
     use_cookies = COOKIES_PATH.is_file() and os.getenv("USE_YOUTUBE_COOKIES", "1") != "0"
     search_profiles = [youtube_options(use_cookies)]
     if use_cookies:
@@ -638,6 +790,9 @@ def search_song(query: str, download: bool = False) -> dict[str, Any]:
                 "format": "bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio/best",
                 "outtmpl": str(CACHE_DIR / "%(id)s.%(ext)s"),
                 "overwrites": False,
+                "postprocessors": [{"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "0"}],
+                "keep_fragments": False,
+                "merge_output_format": "mp3",
             }
         )
 
@@ -677,35 +832,45 @@ def downloaded_audio(song: dict[str, Any]) -> Path:
     reported_paths = [
         song.get("filepath"),
         song.get("_filename"),
+        song.get("filename"),
     ]
     for download in song.get("requested_downloads") or []:
         if isinstance(download, dict):
             reported_paths.append(download.get("filepath"))
             reported_paths.append(download.get("_filename"))
+            reported_paths.append(download.get("filename"))
 
-    audio_suffixes = {".mp3", ".m4a", ".webm", ".opus", ".wav"}
+    audio_suffixes = {".mp3", ".m4a", ".mp4", ".webm", ".weba", ".opus", ".ogg", ".wav"}
     for reported_path in reported_paths:
         if reported_path:
             path = Path(reported_path)
+            if not path.is_absolute():
+                path = BASE_DIR / path
             if path.is_file() and path.suffix.lower() in audio_suffixes:
                 return path
 
-    song_id = song.get("id", "")
-    matches = list(CACHE_DIR.glob(f"{song_id}.*"))
+    song_id = str(song.get("id") or "")
+    matches = list(CACHE_DIR.rglob(f"{song_id}.*")) if song_id else []
 
     audio_files = [path for path in matches if path.suffix.lower() in audio_suffixes]
 
     if not audio_files:
         all_files = [
             path
-            for path in CACHE_DIR.iterdir()
+            for path in CACHE_DIR.rglob("*")
             if path.is_file() and path.suffix.lower() in audio_suffixes
         ]
         if all_files:
             return max(all_files, key=os.path.getctime)
+        logger.warning(
+            "Could not locate downloaded audio. song_id=%s reported_paths=%s cache_dir=%s",
+            song_id,
+            [str(path) for path in reported_paths if path],
+            CACHE_DIR,
+        )
         raise FileNotFoundError("تعذر تجهيز الملف الصوتي")
 
-    return audio_files[0]
+    return max(audio_files, key=os.path.getctime)
 
 
 def normalized_query(query: str) -> str:
@@ -932,7 +1097,7 @@ def save_warnings() -> None:
 
 
 async def get_protection_target(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Any | None:
-    """الحصول على العضو المستهدف من الرد أو منشن تيليجرام الحقيقي."""
+    """الحصول على العضو المستهدف من الرد أو منشن تيليجرام الحقيقي أو اسم المستخدم."""
     message = update.effective_message
     chat = update.effective_chat
     if not message or not chat:
@@ -946,21 +1111,127 @@ async def get_protection_target(update: Update, context: ContextTypes.DEFAULT_TY
                 break
 
     if target is None:
-        await message.reply_text("⚠️ رد على رسالة العضو أو استخدم منشن تيليجرام حقيقي.")
+        username_match = re.search(r"@([A-Za-z0-9_]{3,32})", message.text or "")
+        if username_match:
+            username = username_match.group(1)
+            try:
+                resolved_chat = await context.bot.get_chat(f"@{username}")
+                target = resolved_chat.username and resolved_chat
+            except Exception:
+                target = None
+
+    if target is None:
+        await message.reply_text("⚠️ رد على رسالة العضو أو استخدم منشن تيليجرام حقيقي أو @username.")
         return None
-    if target.is_bot:
+
+    user_obj = target if getattr(target, "id", None) is not None else None
+
+    if user_obj is None or getattr(user_obj, "is_bot", False):
         await message.reply_text("⚠️ لا يمكن تطبيق الإجراء على بوت.")
         return None
 
     try:
-        member = await context.bot.get_chat_member(chat.id, target.id)
+        member = await context.bot.get_chat_member(chat.id, user_obj.id)
     except Exception:
         await message.reply_text("❌ لم أستطع العثور على هذا العضو في المجموعة.")
         return None
     if member.status in {"administrator", "creator"}:
         await message.reply_text("⚠️ لا يمكن تطبيق الإجراء على مشرف.")
         return None
-    return target
+    return user_obj
+
+
+async def user_info_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """عرض تفاصيل المستخدم داخل المجموعة: ايدي، اسم، عدد الرسائل، التحذيرات."""
+    message = update.effective_message
+    chat = update.effective_chat
+    if not message or not chat or not message.text:
+        return
+
+    text = message.text.strip()
+    match = re.match(r"^(ايدي|آيدي|/id|id)(?:\s+.*)?$", text, flags=re.IGNORECASE)
+    if not match:
+        return
+
+    target = await get_protection_target(update, context)
+    if target is None:
+        return
+
+    try:
+        member = await context.bot.get_chat_member(chat.id, target.id)
+    except Exception:
+        await message.reply_text("❌ لم أستطع جلب بيانات هذا العضو.")
+        return
+
+    history = []
+    try:
+        history = await context.bot.get_chat_history(chat_id=chat.id, limit=200)
+    except Exception:
+        history = []
+
+    message_count = 0
+    for msg in history:
+        if getattr(msg.from_user, "id", None) == target.id:
+            message_count += 1
+
+    warnings_count = WARNINGS.get(warning_key(chat.id, target.id), 0)
+    status_text = {
+        "creator": "مالك المجموعة",
+        "administrator": "مشرف",
+        "member": "عضو",
+        "restricted": "مقيّد",
+        "left": "غادر",
+        "kicked": "محظور",
+    }.get(member.status, member.status)
+
+    username_text = f"@{target.username}" if getattr(target, "username", None) else "—"
+    first_name = getattr(target, "first_name", "") or "—"
+    last_name = getattr(target, "last_name", "") or ""
+    full_name = f"{first_name} {last_name}".strip() or "—"
+
+    response = (
+        "🧾 تفاصيل العضو\n"
+        f"👤 الاسم: {full_name}\n"
+        f"@ حساب: {username_text}\n"
+        f"🆔 الايدي: {target.id}\n"
+        f"📌 الحالة: {status_text}\n"
+        f"💬 عدد الرسائل: {message_count}\n"
+        f"⚠️ التحذيرات: {warnings_count}\n"
+        f"🏠 المجموعة: {chat.title or chat.id}"
+    )
+    await message.reply_text(response)
+
+
+async def delete_my_messages(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """مسح رسائل المستخدم الحالي داخل المجموعة."""
+    message = update.effective_message
+    if not message or not message.text:
+        return
+
+    text = message.text.strip()
+    if text not in {"مسح رسائلي", "مسح رسائلي ", "مسح رسائلي  ", "مسح رسائلي "}:
+        return
+
+    user = message.from_user
+    if user is None:
+        return
+
+    try:
+        history = await context.bot.get_chat_history(chat_id=message.chat.id, limit=200)
+    except Exception:
+        await message.reply_text("❌ تعذر الوصول إلى رسائل المجموعة.")
+        return
+
+    deleted = 0
+    for msg in history:
+        if msg.from_user and msg.from_user.id == user.id and msg.message_id != message.message_id:
+            try:
+                await msg.delete()
+                deleted += 1
+            except Exception:
+                pass
+
+    await message.reply_text(f"🧹 تم حذف {deleted} رسالة لك داخل هذه المجموعة.")
 
 
 async def owner_management(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -999,6 +1270,25 @@ async def owner_management(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         expires_at = parse_datetime(settings.get("expires_at"))
         status = "مفعّل" if is_chat_active(chat.id) else "متوقف"
         await message.reply_text(f"🔐 حالة الاشتراك: {status}\n⏳ ينتهي: {format_datetime(expires_at)}")
+        raise ApplicationHandlerStop
+
+    if normalized.startswith("تاريخ"):
+        expires_at = parse_datetime(settings.get("expires_at"))
+        if expires_at is None:
+            await message.reply_text("⏳ لا يوجد اشتراك مفعّل لهذه المجموعة حالياً.")
+            raise ApplicationHandlerStop
+        remaining = expires_at - now_utc()
+        if remaining.total_seconds() <= 0:
+            await message.reply_text("⚠️ انتهى اشتراك هذه المجموعة، ويجب تجديده.")
+            raise ApplicationHandlerStop
+        total_seconds = max(0, int(remaining.total_seconds()))
+        days, remainder = divmod(total_seconds, 86400)
+        hours, remainder = divmod(remainder, 3600)
+        minutes, _ = divmod(remainder, 60)
+        await message.reply_text(
+            f"🗓️ تاريخ انتهاء الاشتراك: {format_datetime(expires_at)}\n"
+            f"⏳ باقي: {days} يوم، {hours} ساعة، {minutes} دقيقة"
+        )
         raise ApplicationHandlerStop
 
     if normalized.startswith("تفعيل"):
@@ -1151,13 +1441,8 @@ async def forced_subscription_guard(update: Update, context: ContextTypes.DEFAUL
     channel = forced_channel(chat.id) or ""
     label = forced_channel_label(channel)
     await message.reply_text(
-        f"🔐 يجب الاشتراك في {label} قبل استخدام البوت.",
-        reply_markup=InlineKeyboardMarkup(
-            [
-                [InlineKeyboardButton(label, url=channel_join_url(channel))],
-                [InlineKeyboardButton("تحققت", callback_data="force_sub:check")],
-            ]
-        ),
+        f"🔐 يجب الاشتراك في {label} قبل استخدام البوت.\n\n"
+        f"📎 اضغط هنا للدخول: {channel_join_url(channel)}"
     )
     raise ApplicationHandlerStop
 
@@ -1186,13 +1471,8 @@ async def callback_preflight(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if refresh and query.message:
         try:
             await query.edit_message_text(
-                f"🔐 يجب الاشتراك في {label} قبل استخدام البوت.",
-                reply_markup=InlineKeyboardMarkup(
-                    [
-                        [InlineKeyboardButton(label, url=channel_join_url(channel))],
-                        [InlineKeyboardButton("تحققت", callback_data="force_sub:check")],
-                    ]
-                ),
+                f"🔐 يجب الاشتراك في {label} قبل استخدام البوت.\n\n"
+                f"📎 الرابط: {channel_join_url(channel)}"
             )
         except Exception:
             pass
@@ -2079,6 +2359,7 @@ def build_application() -> Application:
     application.add_handler(CommandHandler("warn", warn_member))
     application.add_handler(CommandHandler("unwarn", unwarn_member))
     application.add_handler(CommandHandler("clearwarnings", clear_warnings))
+    application.add_handler(CommandHandler("id", user_info_command))
     application.add_handler(CommandHandler("games", games_command))
     application.add_handler(MessageHandler(
         filters.Regex(r"^(العاب|ألعاب)$") & filters.TEXT,
@@ -2104,6 +2385,14 @@ def build_application() -> Application:
     application.add_handler(MessageHandler(
         filters.Regex(r"^مسح تحذيرات(?:\s+.+)?$") & filters.TEXT & filters.ChatType.GROUPS,
         clear_warnings,
+    ))
+    application.add_handler(MessageHandler(
+        filters.Regex(r"^(ايدي|آيدي|/id|id)(?:\s+.*)?$") & filters.TEXT & filters.ChatType.GROUPS,
+        user_info_command,
+    ))
+    application.add_handler(MessageHandler(
+        filters.Regex(r"^مسح رسائلي$") & filters.TEXT & filters.ChatType.GROUPS,
+        delete_my_messages,
     ))
 
     # عرض الأوامر حسب صلاحية المستخدم
